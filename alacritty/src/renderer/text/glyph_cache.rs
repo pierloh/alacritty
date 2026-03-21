@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use ahash::RandomState;
 use crossfont::{
-    Error as RasterizerError, FontDesc, FontKey, GlyphKey, Metrics, Rasterize, RasterizedGlyph,
-    Rasterizer, Size, Slant, Style, Weight,
+    Error as RasterizerError, FontDesc, FontKey, GlyphId, GlyphKey, Metrics, Rasterize,
+    RasterizedGlyph, Rasterizer, Size, Slant, Style, Weight,
 };
 use log::{error, info};
 use unicode_width::UnicodeWidthChar;
@@ -13,6 +13,7 @@ use crate::config::ui_config::Delta;
 use crate::gl::types::*;
 
 use super::builtin_font;
+use super::shaping::Shaper;
 
 /// `LoadGlyph` allows for copying a rasterized glyph into graphics memory.
 pub trait LoadGlyph {
@@ -107,7 +108,7 @@ impl GlyphCache {
         // Need to load at least one glyph for the face before calling metrics.
         // The glyph requested here ('m' at the time of writing) has no special
         // meaning.
-        rasterizer.get_glyph(GlyphKey { font_key: key, character: 'm', size: font.size() })?;
+        rasterizer.get_glyph(GlyphKey { font_key: key, character: 'm'.into(), size: font.size() })?;
 
         let mut metrics = rasterizer.metrics(key, font.size())?;
         metrics.strikeout_position += font.glyph_offset.y as f32;
@@ -119,7 +120,7 @@ impl GlyphCache {
 
         // Cache all ascii characters.
         for i in 32u8..=126u8 {
-            self.get(GlyphKey { font_key: font, character: i as char, size }, loader, true);
+            self.get(GlyphKey { font_key: font, character: (i as char).into(), size }, loader, true);
         }
     }
 
@@ -211,12 +212,17 @@ impl GlyphCache {
         let rasterized = self
             .builtin_box_drawing
             .then(|| {
-                builtin_font::builtin_glyph(
-                    glyph_key.character,
-                    &self.metrics,
-                    &self.font_offset,
-                    &self.glyph_offset,
-                )
+                if let GlyphId::Char(c) = glyph_key.character {
+                    builtin_font::builtin_glyph(
+                        c,
+                        &self.metrics,
+                        &self.font_offset,
+                        &self.glyph_offset,
+                    )
+                } else {
+                    // GlyphId::Index glyphs skip builtin font lookup entirely.
+                    None
+                }
             })
             .flatten()
             .map_or_else(|| self.rasterizer.get_glyph(glyph_key), Ok);
@@ -226,7 +232,7 @@ impl GlyphCache {
             // Load fallback glyph.
             Err(RasterizerError::MissingGlyph(rasterized)) if show_missing => {
                 // Use `\0` as "missing" glyph to cache it only once.
-                let missing_key = GlyphKey { character: '\0', ..glyph_key };
+                let missing_key = GlyphKey { character: GlyphId::Char('\0'), ..glyph_key };
                 if let Some(glyph) = self.cache.get(&missing_key) {
                     *glyph
                 } else {
@@ -260,7 +266,12 @@ impl GlyphCache {
         // right side of the preceding character. Since we render the
         // zero-width characters inside the preceding character, the
         // anchor has been moved to the right by one cell.
-        if glyph.character.width() == Some(0) {
+        let is_zero_width = match glyph.glyph_id {
+            GlyphId::Char(c) => c.width() == Some(0),
+            // For Index glyphs, use bitmap dimensions: zero width means zero-width glyph.
+            GlyphId::Index(_) => glyph.width == 0,
+        };
+        if is_zero_width {
             glyph.left += self.metrics.average_advance as i32;
         }
 
@@ -314,5 +325,10 @@ impl GlyphCache {
         self.load_glyphs_for_font(self.bold_key, loader);
         self.load_glyphs_for_font(self.italic_key, loader);
         self.load_glyphs_for_font(self.bold_italic_key, loader);
+    }
+
+    /// Create a text shaper for ligature support using the current font.
+    pub fn create_shaper(&self, features: &[String]) -> Option<Shaper> {
+        Shaper::new(&self.rasterizer, self.font_key, features)
     }
 }

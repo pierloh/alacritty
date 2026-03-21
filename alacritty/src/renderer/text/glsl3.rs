@@ -307,8 +307,8 @@ struct InstanceData {
     g: u8,
     b: u8,
 
-    // Cell flags like multicolor or fullwidth character.
-    cell_flags: RenderingGlyphFlags,
+    // Cell flags packed with cell span: bits 0-1 = COLORED|WIDE_CHAR, bits 2-4 = span (1-8).
+    cell_flags: u8,
 
     // Background color.
     bg_r: u8,
@@ -344,9 +344,17 @@ impl TextRenderBatch for Batch {
             self.tex = glyph.tex_id;
         }
 
-        let mut cell_flags = RenderingGlyphFlags::empty();
-        cell_flags.set(RenderingGlyphFlags::COLORED, glyph.multicolor);
-        cell_flags.set(RenderingGlyphFlags::WIDE_CHAR, cell.flags.contains(Flags::WIDE_CHAR));
+        let mut flags_byte = 0u8;
+        if glyph.multicolor {
+            flags_byte |= RenderingGlyphFlags::COLORED.bits();
+        }
+        if cell.flags.contains(Flags::WIDE_CHAR) {
+            flags_byte |= RenderingGlyphFlags::WIDE_CHAR.bits();
+        }
+        // Encode cell span (1-7) into bits 2-4. Max 7 since 3 bits can't hold 8
+        // (8 & 0x7 wraps to 0).
+        let span = cell.cell_span.clamp(1, 7);
+        flags_byte |= (span & 0x7) << 2;
 
         self.instances.push(InstanceData {
             col: cell.point.column.0 as u16,
@@ -365,7 +373,7 @@ impl TextRenderBatch for Batch {
             r: cell.fg.r,
             g: cell.fg.g,
             b: cell.fg.b,
-            cell_flags,
+            cell_flags: flags_byte,
 
             bg_r: cell.bg.r,
             bg_g: cell.bg.g,

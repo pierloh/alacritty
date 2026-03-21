@@ -1,0 +1,3 @@
+[submodule "deps/crossfont"]
+	path = deps/crossfont
+	url = https://github.com/pierloh/crossfont.git
