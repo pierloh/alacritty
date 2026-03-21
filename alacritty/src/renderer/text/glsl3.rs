@@ -420,6 +420,12 @@ pub struct TextShaderProgram {
     ///
     /// Rendering is split into two passes; one for backgrounds, and one for text.
     u_rendering_pass: GLint,
+
+    /// FBO mode flag for custom shaders.
+    ///
+    /// When set, the shader uses standard alpha blending instead of dual-source,
+    /// since dual-source blending doesn't work with FBOs on macOS Metal.
+    u_fbo_mode: GLint,
 }
 
 impl TextShaderProgram {
@@ -429,6 +435,7 @@ impl TextShaderProgram {
             u_projection: program.get_uniform_location(c"projection")?,
             u_cell_dim: program.get_uniform_location(c"cellDim")?,
             u_rendering_pass: program.get_uniform_location(c"renderingPass")?,
+            u_fbo_mode: program.get_uniform_location(c"fboMode")?,
             program,
         })
     }
@@ -447,6 +454,14 @@ impl TextShaderProgram {
 
         unsafe {
             gl::Uniform1i(self.u_rendering_pass, value);
+        }
+    }
+
+    /// Set FBO rendering mode. When enabled, uses standard alpha blending
+    /// instead of dual-source (for macOS Metal FBO compatibility).
+    pub fn set_fbo_mode(&self, enabled: bool) {
+        unsafe {
+            gl::Uniform1i(self.u_fbo_mode, i32::from(enabled));
         }
     }
 }

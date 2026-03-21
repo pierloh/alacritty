@@ -375,10 +375,11 @@ impl WindowContext {
         // Force the display to process any pending display update.
         self.display.process_renderer_update();
 
-        // Request immediate re-draw if visual bell animation is not finished yet.
-        if !self.display.visual_bell.completed() {
-            // We can get an OS redraw which bypasses alacritty's frame throttling, thus
-            // marking the window as dirty when we don't have frame yet.
+        // Request immediate re-draw if visual bell animation is not finished yet,
+        // or if custom shaders need continuous rendering.
+        let needs_continuous =
+            !self.display.visual_bell.completed() || self.display.needs_shader_redraw();
+        if needs_continuous {
             if self.display.window.has_frame {
                 self.display.window.request_redraw();
             } else {
@@ -388,13 +389,25 @@ impl WindowContext {
 
         // Redraw the window.
         let terminal = self.terminal.lock();
+        let mouse_pos = [self.mouse.x as f32, self.mouse.y as f32];
         self.display.draw(
             terminal,
             scheduler,
             &self.message_buffer,
             &self.config,
             &mut self.search_state,
+            mouse_pos,
         );
+
+        // Re-check after draw -- cursor state may have been updated inside draw(),
+        // starting a new animation that needs continuous rendering.
+        if !needs_continuous && self.display.needs_shader_redraw() {
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            } else {
+                self.dirty = true;
+            }
+        }
     }
 
     /// Process events for this terminal window.

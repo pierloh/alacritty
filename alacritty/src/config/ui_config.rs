@@ -40,6 +40,70 @@ use crate::config::window::WindowConfig;
 const URL_REGEX: &str = "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
                          [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`\\\\]+";
 
+/// Paths to custom post-process shaders (Ghostty-compatible).
+///
+/// Accepts a single string or array of strings in TOML:
+/// ```toml
+/// custom-shader = "glow.glsl"
+/// custom-shader = ["glow.glsl", "ripple.glsl"]
+/// ```
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CustomShaderPaths(pub Vec<PathBuf>);
+
+impl CustomShaderPaths {
+    /// Whether any custom shaders are configured.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for CustomShaderPaths {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PathsVisitor;
+        impl<'a> serde::de::Visitor<'a> for PathsVisitor {
+            type Value = CustomShaderPaths;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or array of strings")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.is_empty() {
+                    Ok(CustomShaderPaths(Vec::new()))
+                } else {
+                    Ok(CustomShaderPaths(vec![PathBuf::from(v)]))
+                }
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'a>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut paths = Vec::new();
+                while let Some(s) = seq.next_element::<String>()? {
+                    if !s.is_empty() {
+                        paths.push(PathBuf::from(s));
+                    }
+                }
+                Ok(CustomShaderPaths(paths))
+            }
+        }
+
+        deserializer.deserialize_any(PathsVisitor)
+    }
+}
+
+impl SerdeReplace for CustomShaderPaths {
+    fn replace(&mut self, value: toml::Value) -> Result<(), Box<dyn std::error::Error>> {
+        *self = Self::deserialize(value)?;
+        Ok(())
+    }
+}
+
 #[derive(ConfigDeserialize, Serialize, Default, Clone, Debug, PartialEq)]
 pub struct UiConfig {
     /// Miscellaneous configuration options.
@@ -713,6 +777,45 @@ mod tests {
                 "Should have exactly one match url {regular_url}, but instead got: {matches:?}"
             )
         }
+    }
+
+    #[test]
+    fn custom_shader_single_string() {
+        let config: UiConfig = toml::from_str(
+            r#"[general]
+custom-shader = "glow.glsl""#,
+        )
+        .unwrap();
+        assert_eq!(config.general.custom_shader.0, vec![PathBuf::from("glow.glsl")]);
+    }
+
+    #[test]
+    fn custom_shader_array() {
+        let config: UiConfig = toml::from_str(
+            r#"[general]
+custom-shader = ["glow.glsl", "ripple.glsl"]"#,
+        )
+        .unwrap();
+        assert_eq!(config.general.custom_shader.0, vec![
+            PathBuf::from("glow.glsl"),
+            PathBuf::from("ripple.glsl")
+        ]);
+    }
+
+    #[test]
+    fn custom_shader_empty_array() {
+        let config: UiConfig = toml::from_str(
+            r#"[general]
+custom-shader = []"#,
+        )
+        .unwrap();
+        assert!(config.general.custom_shader.0.is_empty());
+    }
+
+    #[test]
+    fn custom_shader_omitted() {
+        let config: UiConfig = toml::from_str("").unwrap();
+        assert!(config.general.custom_shader.0.is_empty());
     }
 
     #[test]
