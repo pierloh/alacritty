@@ -12,6 +12,8 @@ use crate::config::font::{Font, FontDescription};
 use crate::config::ui_config::Delta;
 use crate::gl::types::*;
 
+use alacritty_terminal::term::cell::Flags;
+
 use super::builtin_font;
 use super::shaping::Shaper;
 
@@ -330,5 +332,19 @@ impl GlyphCache {
     /// Create a text shaper for ligature support using the current font.
     pub fn create_shaper(&self, features: &[String]) -> Option<Shaper> {
         Shaper::new(&self.rasterizer, self.font_key, features)
+    }
+
+    /// Create a text shaper for a specific font variant.
+    pub fn create_variant_shaper(&self, features: &[String], flags: Flags) -> Option<Shaper> {
+        let key = if flags.contains(Flags::BOLD | Flags::ITALIC) {
+            self.bold_italic_key
+        } else if flags.contains(Flags::BOLD) {
+            self.bold_key
+        } else if flags.contains(Flags::ITALIC) {
+            self.italic_key
+        } else {
+            self.font_key
+        };
+        Shaper::new(&self.rasterizer, key, features)
     }
 }

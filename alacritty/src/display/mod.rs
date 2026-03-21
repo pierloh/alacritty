@@ -398,8 +398,9 @@ pub struct Display {
     glyph_cache: GlyphCache,
     meter: Meter,
 
-    /// Text shaper for ligature support.
-    shaper: Option<Shaper>,
+    /// Text shapers for ligature support, keyed by style variant.
+    /// Index 0 = regular, 1 = bold, 2 = italic, 3 = bold+italic.
+    shapers: [Option<Shaper>; 4],
 
     /// Reusable buffer for line reconstruction during shaping.
     line_scratch: Vec<char>,
@@ -522,20 +523,7 @@ impl Display {
 
         // Create text shaper for ligature support if enabled.
         // Ligatures require GLSL3 for cell span encoding in vertex shader flag bits.
-        let shaper = if config.font.features.is_empty() || !renderer.is_glsl3() {
-            if !config.font.features.is_empty() && !renderer.is_glsl3() {
-                warn!("Ligatures disabled: requires GLSL3 renderer (current: GLES2)");
-            }
-            None
-        } else {
-            let s = glyph_cache.create_shaper(&config.font.features);
-            if s.is_some() {
-                info!("Text shaper created with features: {:?}", config.font.features);
-            } else {
-                info!("Failed to create text shaper (font_data unavailable or no valid features)");
-            }
-            s
-        };
+        let shapers = Self::create_shapers(&glyph_cache, config, renderer.is_glsl3());
 
         Ok(Self {
             context: ManuallyDrop::new(context),
@@ -552,7 +540,7 @@ impl Display {
             size_info,
             font_size,
             window,
-            shaper,
+            shapers,
             line_scratch: Vec::new(),
             pending_renderer_update: Default::default(),
             vi_highlighted_hint_age: Default::default(),
@@ -576,6 +564,50 @@ impl Display {
         if self.context.is_current() {
             self.context.make_not_current_in_place().expect("failed to disable context");
         }
+    }
+
+    /// Create shapers for all font variants (regular, bold, italic, bold+italic).
+    fn create_shapers(
+        glyph_cache: &GlyphCache,
+        config: &UiConfig,
+        is_glsl3: bool,
+    ) -> [Option<Shaper>; 4] {
+        if config.font.features.is_empty() || !is_glsl3 {
+            if !config.font.features.is_empty() && !is_glsl3 {
+                warn!("Ligatures disabled: requires GLSL3 renderer (current: GLES2)");
+            }
+            return [None, None, None, None];
+        }
+
+        let features = &config.font.features;
+        let regular = glyph_cache.create_shaper(features);
+        let bold = glyph_cache.create_variant_shaper(features, Flags::BOLD);
+        let italic = glyph_cache.create_variant_shaper(features, Flags::ITALIC);
+        let bold_italic =
+            glyph_cache.create_variant_shaper(features, Flags::BOLD | Flags::ITALIC);
+
+        let created = [&regular, &bold, &italic, &bold_italic]
+            .iter()
+            .filter(|s| s.is_some())
+            .count();
+        if created > 0 {
+            info!(
+                "Text shapers created ({}/4 variants) with features: {:?}",
+                created, features
+            );
+        } else {
+            info!("Failed to create text shapers (font_data unavailable or no valid features)");
+        }
+
+        [regular, bold, italic, bold_italic]
+    }
+
+    /// Map cell flags to shaper index (0=regular, 1=bold, 2=italic, 3=bold+italic).
+    #[inline]
+    fn shaper_index(flags: Flags) -> usize {
+        let bold = flags.contains(Flags::BOLD) as usize;
+        let italic = flags.contains(Flags::ITALIC) as usize;
+        bold | (italic << 1)
     }
 
     pub fn make_current(&mut self) {
@@ -701,12 +733,9 @@ impl Display {
 
             info!("Cell size: {cell_width} x {cell_height}");
 
-            // Recreate shaper with the new font (GLSL3 only).
-            self.shaper = if config.font.features.is_empty() || !self.renderer.is_glsl3() {
-                None
-            } else {
-                self.glyph_cache.create_shaper(&config.font.features)
-            };
+            // Recreate shapers with the new font (GLSL3 only).
+            self.shapers =
+                Self::create_shapers(&self.glyph_cache, config, self.renderer.is_glsl3());
 
             // Mark entire terminal as damaged since glyph size could change without cell size
             // changes.
@@ -755,8 +784,8 @@ impl Display {
             // Resize damage tracking.
             self.damage_tracker.resize(new_size.screen_lines(), new_size.columns());
 
-            // Clear shaper cache on resize.
-            if let Some(shaper) = &mut self.shaper {
+            // Clear shaper caches on resize.
+            for shaper in self.shapers.iter_mut().flatten() {
                 shaper.clear_cache();
             }
         }
@@ -808,8 +837,11 @@ impl Display {
     ///
     /// Groups cells by line, shapes each line via rustybuzz, and writes back
     /// `glyph_index` and `cell_span` into the cells.
+    ///
+    /// Uses per-variant shapers so bold/italic cells get correct glyph IDs
+    /// from their own font face.
     fn shape_cells(
-        shaper: &mut Shaper,
+        shapers: &mut [Option<Shaper>; 4],
         cells: &mut [RenderableCell],
         columns: usize,
         scratch: &mut Vec<char>,
@@ -842,14 +874,27 @@ impl Display {
                 }
             }
 
-            // Shape the full reconstructed line.
-            if let Some(shaped) = shaper.shape_line(scratch) {
-                // Log first shaped line for debugging.
-                // Write shaped results back to actual cells using column position.
-                // Skip bold/italic cells: shaped glyph IDs are face-specific and
-                // would map to wrong glyphs in non-regular font variants.
+            // Determine which shaper variants are needed on this line.
+            let mut variants_needed = [false; 4];
+            for cell in &cells[line_start..line_end] {
+                variants_needed[Self::shaper_index(cell.flags)] = true;
+            }
+
+            // Shape once per variant, then write back to matching cells.
+            for (idx, needed) in variants_needed.iter().enumerate() {
+                if !needed {
+                    continue;
+                }
+                let shaper = match &mut shapers[idx] {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let shaped = match shaper.shape_line(scratch) {
+                    Some(s) => s,
+                    None => continue,
+                };
                 for cell in &mut cells[line_start..line_end] {
-                    if cell.flags.intersects(Flags::BOLD | Flags::ITALIC) {
+                    if Self::shaper_index(cell.flags) != idx {
                         continue;
                     }
                     let col = cell.point.column.0;
@@ -895,10 +940,11 @@ impl Display {
         let cursor_point = terminal.grid().cursor.point;
 
         // Apply text shaping for ligature support (after content is fully consumed).
-        let shaper = &mut self.shaper;
+        let shapers = &mut self.shapers;
         let scratch = &mut self.line_scratch;
-        if let Some(shaper) = shaper {
-            Self::shape_cells(shaper, &mut grid_cells, self.size_info.columns(), scratch);
+        let has_any_shaper = shapers.iter().any(|s| s.is_some());
+        if has_any_shaper {
+            Self::shape_cells(shapers, &mut grid_cells, self.size_info.columns(), scratch);
 
             // Break only actual ligature groups at the cursor. Texture healing
             // (is_ligature=false) is left intact.
