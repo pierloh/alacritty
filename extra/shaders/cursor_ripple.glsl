@@ -40,6 +40,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     if (progress >= 1.0) return;
 
     // Mode change uses its own timestamp (DECTCEM, not affected by blink).
+    // time_mode_change only fires when DECTCEM toggles without a position
+    // change, so tab/pane switches (which change both) don't trigger it.
     float modeProgress = (iTime - iTimeModeChange) / DURATION;
     float shouldTrigger = (TRIGGER_ON_MODE_CHANGE && modeProgress < 1.0) ? 1.0 : 0.0;
 

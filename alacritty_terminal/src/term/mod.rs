@@ -1960,6 +1960,13 @@ impl<T: EventListener> Handler for Term<T> {
 
                 let range = cursor.line..Line(screen_lines as i32);
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+
+                // Multiplexers (Zellij) use cursor-home + ED 0 instead of ED 2
+                // for tab switches. Clear stale multi-cursor state from the
+                // previous pane; the new pane will re-send if needed.
+                if cursor.line.0 == 0 && cursor.column.0 == 0 {
+                    self.multi_cursor_state = MultiCursorState::default();
+                }
             },
             ansi::ClearMode::All => {
                 if self.mode.contains(TermMode::ALT_SCREEN) {

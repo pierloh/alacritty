@@ -848,24 +848,25 @@ impl Display {
         // at the cursor position (falls through to the _ arm in cursor_rect match).
         // Only update rect when visible OR when position has changed, to avoid
         // overwriting a good rect with a potentially zero-size hidden rect.
-        if cursor_visible
-            || new_rect[0] != cs.current[0]
-            || new_rect[1] != cs.current[1]
-            || mode_changed
-        {
-            let pos_changed = new_rect[0] != cs.current[0] || new_rect[1] != cs.current[1];
+        let pos_changed = new_rect[0] != cs.current[0] || new_rect[1] != cs.current[1];
+        if cursor_visible || pos_changed || mode_changed {
             let size_changed =
                 cursor_visible && (new_rect[2] != cs.current[2] || new_rect[3] != cs.current[3]);
             if pos_changed || size_changed || mode_changed {
                 cs.previous = cs.current;
                 cs.prev_multi_cursor_count = cs.multi_cursor_count;
-                // Skip timer reset for position-only changes when multi-cursors
-                // are active. Through a multiplexer, content rendering moves the
-                // cursor before the multi-cursor sequence arrives, causing a
-                // spurious timer reset that replays animations.
-                // Mode changes always reset the timer (needed for ripple effects).
+                // When multi-cursors are active and incoming extra_cursors is
+                // non-empty, skip the timer reset for position-only moves.
+                // Through a multiplexer, content rendering moves the primary
+                // cursor before the multi-cursor sequence arrives in the same
+                // frame, causing a spurious timer reset that replays animations.
+                //
+                // But when extra_cursors is empty (e.g. switching from a
+                // multi-cursor app to a plain terminal tab), always reset so
+                // the shader pipeline picks up the new cursor position.
                 if mode_changed
-                    || (cs.multi_cursor_count == 0 && extra_cursors.is_empty())
+                    || extra_cursors.is_empty()
+                    || cs.multi_cursor_count == 0
                 {
                     cs.time_cursor_change = now;
                 }
@@ -886,7 +887,10 @@ impl Display {
             }
         }
         cs.visible = cursor_visible;
-        if mode_changed {
+        if mode_changed && !pos_changed {
+            // Only timestamp mode changes at the same position (e.g. vim
+            // mode switch). Tab/pane switches change both DECTCEM and
+            // position; those should not trigger mode-change effects.
             cs.time_mode_change = now;
         }
         cs.app_visible = app_cursor_visible;
