@@ -389,14 +389,12 @@ impl WindowContext {
 
         // Redraw the window.
         let terminal = self.terminal.lock();
-        let mouse_pos = [self.mouse.x as f32, self.mouse.y as f32];
         self.display.draw(
             terminal,
             scheduler,
             &self.message_buffer,
             &self.config,
             &mut self.search_state,
-            mouse_pos,
         );
 
         // Re-check after draw -- cursor state may have been updated inside draw(),

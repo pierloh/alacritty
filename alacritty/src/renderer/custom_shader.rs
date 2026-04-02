@@ -34,19 +34,35 @@ uniform vec2 iResolution;
 // This matches ghostty/shadertoy behavior and is standard for shader uniforms.
 uniform float iTime;
 uniform float iTimeCursorChange;
+uniform float iTimeModeChange;
+
+// Ghostty-compatible singular cursor uniforms (alias index 0 of arrays).
 uniform vec4 iCurrentCursor;
 uniform vec4 iPreviousCursor;
 uniform vec4 iCurrentCursorColor;
+uniform vec4 iPreviousCursorColor;
 uniform float iCursorVisible;
-uniform vec2 iCellSize;
 
+#define CURSORSTYLE_BLOCK        0
+#define CURSORSTYLE_BLOCK_HOLLOW 1
+#define CURSORSTYLE_BAR          2
+#define CURSORSTYLE_UNDERLINE    3
+#define CURSORSTYLE_LOCK         4
+uniform int iCurrentCursorStyle;
+uniform int iPreviousCursorStyle;
+
+// Multi-cursor arrays.
 #define MAX_CURSORS 64
-uniform vec4 iCursors[MAX_CURSORS];
+uniform vec4 iCurrentCursors[MAX_CURSORS];
 uniform vec4 iPreviousCursors[MAX_CURSORS];
-uniform int iCursorTypes[MAX_CURSORS];
-uniform int iCursorCount;
+uniform vec4 iCurrentCursorColors[MAX_CURSORS];
+uniform int iCurrentCursorStyles[MAX_CURSORS];
+uniform int iPreviousCursorStyles[MAX_CURSORS];
+uniform int iCurrentCursorTypes[MAX_CURSORS];
+uniform int iCurrentCursorCount;
 uniform int iPreviousCursorCount;
-uniform float iTimeModeChange;
+
+// Deprecated: not uploaded, defaults to vec2(0). Kept for shader compatibility.
 uniform vec2 iMousePosition;
 
 out vec4 fragColor;
@@ -189,18 +205,24 @@ struct CustomShaderProgram {
     u_resolution: GLint,
     u_time: GLint,
     u_time_cursor_change: GLint,
+    u_time_mode_change: GLint,
+    // Ghostty-compatible singulars.
     u_current_cursor: GLint,
     u_previous_cursor: GLint,
     u_current_cursor_color: GLint,
+    u_previous_cursor_color: GLint,
     u_cursor_visible: GLint,
-    u_cell_size: GLint,
-    u_cursors: GLint,
-    u_prev_cursors: GLint,
-    u_cursor_types: GLint,
-    u_cursor_count: GLint,
-    u_prev_cursor_count: GLint,
-    u_time_mode_change: GLint,
-    u_mouse_pos: GLint,
+    u_current_cursor_style: GLint,
+    u_previous_cursor_style: GLint,
+    // Multi-cursor arrays.
+    u_current_cursors: GLint,
+    u_previous_cursors: GLint,
+    u_current_cursor_colors: GLint,
+    u_current_cursor_styles: GLint,
+    u_previous_cursor_styles: GLint,
+    u_current_cursor_types: GLint,
+    u_current_cursor_count: GLint,
+    u_previous_cursor_count: GLint,
 }
 
 impl CustomShaderProgram {
@@ -242,18 +264,22 @@ impl CustomShaderProgram {
                 u_resolution: get_loc(c"iResolution"),
                 u_time: get_loc(c"iTime"),
                 u_time_cursor_change: get_loc(c"iTimeCursorChange"),
+                u_time_mode_change: get_loc(c"iTimeModeChange"),
                 u_current_cursor: get_loc(c"iCurrentCursor"),
                 u_previous_cursor: get_loc(c"iPreviousCursor"),
                 u_current_cursor_color: get_loc(c"iCurrentCursorColor"),
+                u_previous_cursor_color: get_loc(c"iPreviousCursorColor"),
                 u_cursor_visible: get_loc(c"iCursorVisible"),
-                u_cell_size: get_loc(c"iCellSize"),
-                u_cursors: get_loc(c"iCursors"),
-                u_prev_cursors: get_loc(c"iPreviousCursors"),
-                u_cursor_types: get_loc(c"iCursorTypes"),
-                u_cursor_count: get_loc(c"iCursorCount"),
-                u_prev_cursor_count: get_loc(c"iPreviousCursorCount"),
-                u_time_mode_change: get_loc(c"iTimeModeChange"),
-                u_mouse_pos: get_loc(c"iMousePosition"),
+                u_current_cursor_style: get_loc(c"iCurrentCursorStyle"),
+                u_previous_cursor_style: get_loc(c"iPreviousCursorStyle"),
+                u_current_cursors: get_loc(c"iCurrentCursors"),
+                u_previous_cursors: get_loc(c"iPreviousCursors"),
+                u_current_cursor_colors: get_loc(c"iCurrentCursorColors"),
+                u_current_cursor_styles: get_loc(c"iCurrentCursorStyles"),
+                u_previous_cursor_styles: get_loc(c"iPreviousCursorStyles"),
+                u_current_cursor_types: get_loc(c"iCurrentCursorTypes"),
+                u_current_cursor_count: get_loc(c"iCurrentCursorCount"),
+                u_previous_cursor_count: get_loc(c"iPreviousCursorCount"),
             })
         }
     }
@@ -279,6 +305,9 @@ impl CustomShaderProgram {
             gl::Uniform2f(self.u_resolution, uniforms.resolution[0], uniforms.resolution[1]);
             gl::Uniform1f(self.u_time, uniforms.time);
             gl::Uniform1f(self.u_time_cursor_change, uniforms.time_cursor_change);
+            gl::Uniform1f(self.u_time_mode_change, uniforms.time_mode_change);
+
+            // Ghostty-compatible singulars (alias index 0).
             gl::Uniform4f(
                 self.u_current_cursor,
                 uniforms.current_cursor[0],
@@ -300,26 +329,55 @@ impl CustomShaderProgram {
                 uniforms.current_cursor_color[2],
                 uniforms.current_cursor_color[3],
             );
+            gl::Uniform4f(
+                self.u_previous_cursor_color,
+                uniforms.previous_cursor_color[0],
+                uniforms.previous_cursor_color[1],
+                uniforms.previous_cursor_color[2],
+                uniforms.previous_cursor_color[3],
+            );
             gl::Uniform1f(self.u_cursor_visible, uniforms.cursor_visible);
-            gl::Uniform2f(self.u_cell_size, uniforms.cell_size[0], uniforms.cell_size[1]);
-            gl::Uniform1i(self.u_cursor_count, uniforms.cursor_count);
-            gl::Uniform1i(self.u_prev_cursor_count, uniforms.prev_cursor_count);
-            gl::Uniform1f(self.u_time_mode_change, uniforms.time_mode_change);
-            gl::Uniform2f(self.u_mouse_pos, uniforms.mouse_pos[0], uniforms.mouse_pos[1]);
-            let upload_count =
-                uniforms.cursor_count.max(uniforms.prev_cursor_count).min(MAX_MULTI_CURSORS as i32);
+            gl::Uniform1i(self.u_current_cursor_style, uniforms.current_cursor_style);
+            gl::Uniform1i(self.u_previous_cursor_style, uniforms.previous_cursor_style);
+
+            // Multi-cursor arrays.
+            gl::Uniform1i(self.u_current_cursor_count, uniforms.current_cursor_count);
+            gl::Uniform1i(self.u_previous_cursor_count, uniforms.previous_cursor_count);
+            let upload_count = uniforms
+                .current_cursor_count
+                .max(uniforms.previous_cursor_count)
+                .min(MAX_MULTI_CURSORS as i32);
             if upload_count > 0 {
                 gl::Uniform4fv(
-                    self.u_cursors,
+                    self.u_current_cursors,
                     upload_count,
-                    uniforms.cursors.as_ptr() as *const f32,
+                    uniforms.current_cursors.as_ptr() as *const f32,
                 );
                 gl::Uniform4fv(
-                    self.u_prev_cursors,
+                    self.u_previous_cursors,
                     upload_count,
-                    uniforms.prev_cursors.as_ptr() as *const f32,
+                    uniforms.previous_cursors.as_ptr() as *const f32,
                 );
-                gl::Uniform1iv(self.u_cursor_types, upload_count, uniforms.cursor_types.as_ptr());
+                gl::Uniform4fv(
+                    self.u_current_cursor_colors,
+                    upload_count,
+                    uniforms.current_cursor_colors.as_ptr() as *const f32,
+                );
+                gl::Uniform1iv(
+                    self.u_current_cursor_styles,
+                    upload_count,
+                    uniforms.current_cursor_styles.as_ptr(),
+                );
+                gl::Uniform1iv(
+                    self.u_previous_cursor_styles,
+                    upload_count,
+                    uniforms.previous_cursor_styles.as_ptr(),
+                );
+                gl::Uniform1iv(
+                    self.u_current_cursor_types,
+                    upload_count,
+                    uniforms.current_cursor_types.as_ptr(),
+                );
             }
             gl::BindVertexArray(vao);
             gl::DrawArrays(gl::TRIANGLES, 0, 3);
@@ -344,18 +402,24 @@ pub struct ShaderUniforms {
     pub resolution: [f32; 2],
     pub time: f32,
     pub time_cursor_change: f32,
+    pub time_mode_change: f32,
+    // Ghostty-compatible singulars (alias index 0).
     pub current_cursor: [f32; 4],
     pub previous_cursor: [f32; 4],
     pub current_cursor_color: [f32; 4],
+    pub previous_cursor_color: [f32; 4],
     pub cursor_visible: f32,
-    pub cell_size: [f32; 2],
-    pub cursors: [[f32; 4]; MAX_MULTI_CURSORS],
-    pub prev_cursors: [[f32; 4]; MAX_MULTI_CURSORS],
-    pub cursor_types: [i32; MAX_MULTI_CURSORS],
-    pub cursor_count: i32,
-    pub prev_cursor_count: i32,
-    pub time_mode_change: f32,
-    pub mouse_pos: [f32; 2],
+    pub current_cursor_style: i32,
+    pub previous_cursor_style: i32,
+    // Multi-cursor arrays.
+    pub current_cursors: [[f32; 4]; MAX_MULTI_CURSORS],
+    pub previous_cursors: [[f32; 4]; MAX_MULTI_CURSORS],
+    pub current_cursor_colors: [[f32; 4]; MAX_MULTI_CURSORS],
+    pub current_cursor_styles: [i32; MAX_MULTI_CURSORS],
+    pub previous_cursor_styles: [i32; MAX_MULTI_CURSORS],
+    pub current_cursor_types: [i32; MAX_MULTI_CURSORS],
+    pub current_cursor_count: i32,
+    pub previous_cursor_count: i32,
 }
 
 /// Manages a chain of custom post-process shaders with shared GL resources.

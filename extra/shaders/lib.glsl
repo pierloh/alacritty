@@ -106,27 +106,9 @@ float sdfQuad(vec2 p, vec2 v0, vec2 v1, vec2 v2, vec2 v3) {
 
 // --- Cursor utilities ---
 
-// Detect line jump (cursor changed lines).
-float detectJumpLine(vec2 cur, vec2 prev, float cellH) {
-    return step(cellH * 0.5, abs(cur.y - prev.y));
-}
-
-// Detect cell jump (moved more than 1 cell in any direction).
-float detectJumpCell(vec2 cur, vec2 prev, float cellH, float cellW) {
-    float multiH = step(cellW * 1.5, abs(cur.x - prev.x));
-    float multiV = step(cellH * 1.5, abs(cur.y - prev.y));
-    return max(multiH, multiV);
-}
-
-// Detect any jump (changed line or moved multiple cells).
-// Broader than detectJumpCell: also triggers on single-line changes.
-float detectJump(vec2 cur, vec2 prev, float cellH, float cellW) {
-    return max(detectJumpLine(cur, prev, cellH), detectJumpCell(cur, prev, cellH, cellW));
-}
-
-// Compute cell center from cursor position in normalized coords.
-vec2 cellCenter(vec2 cursorPos, vec2 cellSize) {
-    return cursorPos + cellSize * vec2(0.5, -0.5);
+// Compute cursor center from top-left position and size.
+vec2 cursorCenter(vec2 pos, vec2 size) {
+    return pos + size * vec2(0.5, -0.5);
 }
 
 // Determine which corner leads during diagonal movement.
@@ -140,16 +122,10 @@ float leadingCornerSign(vec2 current, vec2 previous) {
 // Call at the end of mainImage to punch out the cursor from the effect.
 // Uses pixel-space coordinates (fragCoord, not normalized).
 vec4 cursorHoldout(vec4 effectColor, vec4 originalColor, vec2 fragCoord) {
-    if (iCursorCount > 0) {
-        int count = min(iCursorCount, MAX_CURSORS);
-        for (int i = 0; i < count; i++) {
-            vec2 center = iCursors[i].xy + iCursors[i].zw * vec2(0.5, -0.5);
-            if (sdfRect(fragCoord, center, iCursors[i].zw * 0.5) <= 0.0)
-                return originalColor;
-        }
-    } else if (iCursorVisible > 0.0) {
-        vec2 center = iCurrentCursor.xy + iCurrentCursor.zw * vec2(0.5, -0.5);
-        if (sdfRect(fragCoord, center, iCurrentCursor.zw * 0.5) <= 0.0)
+    int count = min(iCurrentCursorCount, MAX_CURSORS);
+    for (int i = 0; i < count; i++) {
+        vec2 center = iCurrentCursors[i].xy + iCurrentCursors[i].zw * vec2(0.5, -0.5);
+        if (sdfRect(fragCoord, center, iCurrentCursors[i].zw * 0.5) <= 0.0)
             return originalColor;
     }
     return effectColor;

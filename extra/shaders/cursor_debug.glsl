@@ -21,56 +21,29 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         return;
     }
 
-    // Estimate cell size from cursor dimensions.
-    float cellH = iCurrentCursor.w;
-    float cellW = max(iCurrentCursor.z, cellH * 0.5);
+    int count = min(iCurrentCursorCount, MAX_CURSORS);
 
-    // Multi-cursor mode (kitty protocol).
-    if (iCursorCount > 0) {
-        int count = min(iCursorCount, MAX_CURSORS);
-
-        // Previous positions: red.
-        for (int i = 0; i < count; i++) {
-            vec2 prev = iPreviousCursors[i].xy;
-            float pW = iPreviousCursors[i].z;
-            float pH = iPreviousCursors[i].w;
-            if (pW > 0.0 &&
-                fragCoord.x >= prev.x && fragCoord.x <= prev.x + pW &&
-                fragCoord.y <= prev.y && fragCoord.y >= prev.y - pH) {
-                fragColor = vec4(mix(color.rgb, vec3(1.0, 0.0, 0.0), 0.3), color.a);
-                return;
-            }
-        }
-
-        // Current positions: green.
-        for (int i = 0; i < count; i++) {
-            vec2 pos = iCursors[i].xy;
-            float cW = iCursors[i].z;
-            float cH = iCursors[i].w;
-            if (fragCoord.x >= pos.x && fragCoord.x <= pos.x + cW &&
-                fragCoord.y <= pos.y && fragCoord.y >= pos.y - cH) {
-                fragColor = vec4(mix(color.rgb, vec3(0.0, 1.0, 0.0), 0.4), color.a);
-                return;
-            }
-        }
-
-        fragColor = color;
-        return;
-    }
-
-    // Single-cursor fallback (insert mode).
-    if (iCursorVisible > 0.0) {
-        vec2 prev = iPreviousCursor.xy;
-        if (prev.x >= 0.0 &&
-            fragCoord.x >= prev.x && fragCoord.x <= prev.x + cellW &&
-            fragCoord.y <= prev.y && fragCoord.y >= prev.y - cellH) {
+    // Previous positions: red.
+    int previousCount = min(iPreviousCursorCount, MAX_CURSORS);
+    for (int i = 0; i < previousCount; i++) {
+        vec2 previousPos = iPreviousCursors[i].xy;
+        float previousW = iPreviousCursors[i].z;
+        float previousH = iPreviousCursors[i].w;
+        if (previousW > 0.0 &&
+            fragCoord.x >= previousPos.x && fragCoord.x <= previousPos.x + previousW &&
+            fragCoord.y <= previousPos.y && fragCoord.y >= previousPos.y - previousH) {
             fragColor = vec4(mix(color.rgb, vec3(1.0, 0.0, 0.0), 0.3), color.a);
             return;
         }
+    }
 
-        vec2 cur = iCurrentCursor.xy;
-        if (fragCoord.x >= cur.x && fragCoord.x <= cur.x + cellW &&
-            fragCoord.y <= cur.y && fragCoord.y >= cur.y - cellH) {
+    // Current positions: green.
+    for (int i = 0; i < count; i++) {
+        vec2 currentPos = iCurrentCursors[i].xy;
+        float currentW = iCurrentCursors[i].z;
+        float currentH = iCurrentCursors[i].w;
+        if (fragCoord.x >= currentPos.x && fragCoord.x <= currentPos.x + currentW &&
+            fragCoord.y <= currentPos.y && fragCoord.y >= currentPos.y - currentH) {
             fragColor = vec4(mix(color.rgb, vec3(0.0, 1.0, 0.0), 0.4), color.a);
             return;
         }

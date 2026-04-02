@@ -349,16 +349,20 @@ struct CursorState {
     time_cursor_change: f32,
     visible: bool,
     multi_cursors: [[f32; 4]; MAX_MULTI_CURSORS],
-    prev_multi_cursors: [[f32; 4]; MAX_MULTI_CURSORS],
+    previous_multi_cursors: [[f32; 4]; MAX_MULTI_CURSORS],
     multi_cursor_types: [i32; MAX_MULTI_CURSORS],
     multi_cursor_count: i32,
-    prev_multi_cursor_count: i32,
+    previous_multi_cursor_count: i32,
     /// App-level cursor visibility (DECTCEM), not affected by blink.
     app_visible: bool,
     /// Timestamp of the last app-level mode change (DECTCEM transition).
     time_mode_change: f32,
-    /// Mouse position in pixel coordinates.
-    mouse_pos: [f32; 2],
+    /// Previous cursor color for transition detection.
+    previous_color: [f32; 4],
+    /// Current cursor style (ghostty-compatible int).
+    cursor_style: i32,
+    /// Previous cursor style for transition detection.
+    previous_cursor_style: i32,
 }
 
 impl Default for CursorState {
@@ -371,13 +375,15 @@ impl Default for CursorState {
             time_cursor_change: 0.0,
             visible: true,
             multi_cursors: [[0.0; 4]; MAX_MULTI_CURSORS],
-            prev_multi_cursors: [[0.0; 4]; MAX_MULTI_CURSORS],
+            previous_multi_cursors: [[0.0; 4]; MAX_MULTI_CURSORS],
             multi_cursor_types: [0; MAX_MULTI_CURSORS],
             multi_cursor_count: 0,
-            prev_multi_cursor_count: 0,
+            previous_multi_cursor_count: 0,
             app_visible: true,
             time_mode_change: 0.0,
-            mouse_pos: [0.0, 0.0],
+            previous_color: [1.0, 1.0, 1.0, 1.0],
+            cursor_style: 0,
+            previous_cursor_style: 0,
         }
     }
 }
@@ -792,6 +798,19 @@ impl Display {
         since_cursor < MAX_ANIMATION_SECS || since_mode < MAX_ANIMATION_SECS
     }
 
+    /// Convert cursor shape to ghostty-compatible int for shader uniforms.
+    /// Hidden is not a style -- `iCursorVisible` signals that instead.
+    /// Returns `None` for Hidden so callers preserve the last-known style.
+    fn cursor_style_int(shape: CursorShape) -> Option<i32> {
+        match shape {
+            CursorShape::Block => Some(0),
+            CursorShape::HollowBlock => Some(1),
+            CursorShape::Beam => Some(2),
+            CursorShape::Underline => Some(3),
+            CursorShape::Hidden => None,
+        }
+    }
+
     /// Compute cursor rect as (x_left, y_bottom, w, h) in top-left-origin
     /// pixel space, matching the actual rendered cursor shape and size.
     fn cursor_rect(cursor: &RenderableCursor, size_info: &SizeInfo, thickness: f32) -> [f32; 4] {
@@ -854,7 +873,7 @@ impl Display {
                 cursor_visible && (new_rect[2] != cs.current[2] || new_rect[3] != cs.current[3]);
             if pos_changed || size_changed || mode_changed {
                 cs.previous = cs.current;
-                cs.prev_multi_cursor_count = cs.multi_cursor_count;
+                cs.previous_multi_cursor_count = cs.multi_cursor_count;
                 // When multi-cursors are active and incoming extra_cursors is
                 // non-empty, skip the timer reset for position-only moves.
                 // Through a multiplexer, content rendering moves the primary
@@ -878,6 +897,9 @@ impl Display {
             }
             if cursor_visible {
                 // Full update: position, size, and color.
+                if new_color != cs.color {
+                    cs.previous_color = cs.color;
+                }
                 cs.current = new_rect;
                 cs.color = new_color;
             } else {
@@ -887,6 +909,16 @@ impl Display {
             }
         }
         cs.visible = cursor_visible;
+
+        // Track cursor style and color changes.
+        // Hidden returns None -- preserve last-known style (iCursorVisible handles visibility).
+        if let Some(new_style) = Self::cursor_style_int(cursor.shape()) {
+            if new_style != cs.cursor_style {
+                cs.previous_cursor_style = cs.cursor_style;
+                cs.cursor_style = new_style;
+            }
+        }
+
         if mode_changed && !pos_changed {
             // Only timestamp mode changes at the same position (e.g. vim
             // mode switch). Tab/pane switches change both DECTCEM and
@@ -900,8 +932,8 @@ impl Display {
         if extra_cursors.is_empty() {
             if cs.multi_cursor_count != 0 {
                 // Cursor count transition (multi -> single): treat as mode change.
-                cs.prev_multi_cursors = cs.multi_cursors;
-                cs.prev_multi_cursor_count = cs.multi_cursor_count;
+                cs.previous_multi_cursors = cs.multi_cursors;
+                cs.previous_multi_cursor_count = cs.multi_cursor_count;
                 cs.time_cursor_change = now;
                 cs.multi_cursor_count = 0;
             }
@@ -924,15 +956,15 @@ impl Display {
             let positions_changed = count as i32 != cs.multi_cursor_count
                 || new_cursors[..count] != cs.multi_cursors[..count];
             if positions_changed {
-                cs.prev_multi_cursors = cs.multi_cursors;
-                cs.prev_multi_cursor_count = cs.multi_cursor_count;
+                cs.previous_multi_cursors = cs.multi_cursors;
+                cs.previous_multi_cursor_count = cs.multi_cursor_count;
                 cs.time_cursor_change = now;
 
                 // New cursors (indices beyond old count) have no previous position.
                 // Initialize their previous to current to avoid trails from (0,0).
                 let old_count = cs.multi_cursor_count.max(0) as usize;
                 if count > old_count {
-                    cs.prev_multi_cursors[old_count..count]
+                    cs.previous_multi_cursors[old_count..count]
                         .copy_from_slice(&new_cursors[old_count..count]);
                 }
             }
@@ -940,7 +972,7 @@ impl Display {
 
             // On mode change, suppress trails by syncing all previous to current.
             if mode_changed {
-                cs.prev_multi_cursors[..count].copy_from_slice(&new_cursors[..count]);
+                cs.previous_multi_cursors[..count].copy_from_slice(&new_cursors[..count]);
             }
 
             cs.multi_cursor_count = count as i32;
@@ -979,33 +1011,73 @@ impl Display {
 
             let cs = &self.cursor_state;
             let time = cs.start_instant.elapsed().as_secs_f64() as f32;
-            // Always send real cursor position. Shaders use iCursorVisible
-            // to decide whether to apply effects.
+
+            // Build consolidated cursor arrays: primary at index 0, secondaries at 1+.
+            let mut current_cursors = [[0.0f32; 4]; MAX_MULTI_CURSORS];
+            let mut previous_cursors = [[0.0f32; 4]; MAX_MULTI_CURSORS];
+            let mut current_cursor_colors = [[0.0f32; 4]; MAX_MULTI_CURSORS];
+            let mut current_cursor_styles = [0i32; MAX_MULTI_CURSORS];
+            let mut previous_cursor_styles = [0i32; MAX_MULTI_CURSORS];
+            let mut current_cursor_types = [0i32; MAX_MULTI_CURSORS];
+
+            // Index 0: primary cursor (always populated for previous-position data).
+            current_cursors[0] = cs.current;
+            previous_cursors[0] = cs.previous;
+            current_cursor_colors[0] = cs.color;
+            current_cursor_styles[0] = cs.cursor_style;
+            previous_cursor_styles[0] = cs.previous_cursor_style;
+            // current_cursor_types[0] = 0 (primary) -- already zero-initialized.
+
+            // Indices 1+: secondary cursors from kitty multi-cursor protocol.
+            // Secondary cursors share the primary cursor's color and style.
+            let sec = cs.multi_cursor_count.max(0) as usize;
+            let previous_sec = cs.previous_multi_cursor_count.max(0) as usize;
+            let max_sec = sec.max(previous_sec).min(MAX_MULTI_CURSORS - 1);
+            for i in 0..max_sec {
+                if i < sec {
+                    current_cursors[1 + i] = cs.multi_cursors[i];
+                    current_cursor_colors[1 + i] = cs.color;
+                    current_cursor_styles[1 + i] = cs.cursor_style;
+                    current_cursor_types[1 + i] = cs.multi_cursor_types[i];
+                }
+                if i < previous_sec {
+                    previous_cursors[1 + i] = cs.previous_multi_cursors[i];
+                }
+                previous_cursor_styles[1 + i] = cs.previous_cursor_style;
+            }
+
+            // Per spec: extra cursors share main cursor's blink state, but
+            // main cursor visibility (DECTCEM) does not affect extra cursors.
+            // Blink-off = !visible && app_visible. DECTCEM-off = !app_visible.
+            let (current_cursor_count, previous_cursor_count) =
+                if cs.visible || !cs.app_visible {
+                    (1 + cs.multi_cursor_count, 1 + cs.previous_multi_cursor_count)
+                } else {
+                    // Blink-off: suppress current cursors but keep previous_cursor_count
+                    // so shaders can animate cursor disappearance via iPreviousCursors.
+                    (0, 1 + cs.previous_multi_cursor_count)
+                };
+
             let uniforms = ShaderUniforms {
                 resolution: [size_info.width(), size_info.height()],
                 time,
                 time_cursor_change: cs.time_cursor_change,
+                time_mode_change: cs.time_mode_change,
                 current_cursor: cs.current,
                 previous_cursor: cs.previous,
                 current_cursor_color: cs.color,
+                previous_cursor_color: cs.previous_color,
                 cursor_visible: if cs.visible { 1.0 } else { 0.0 },
-                cell_size: [size_info.cell_width(), size_info.cell_height()],
-                cursors: cs.multi_cursors,
-                prev_cursors: cs.prev_multi_cursors,
-                cursor_types: cs.multi_cursor_types,
-                // Per spec: extra cursors share main cursor's blink state, but
-                // main cursor visibility (DECTCEM) does not affect extra cursors.
-                // Blink-off = !visible && app_visible. DECTCEM-off = !app_visible.
-                cursor_count: if cs.visible || !cs.app_visible {
-                    cs.multi_cursor_count
-                } else {
-                    // Blink-off: suppress current cursors but keep prev_cursor_count
-                    // so shaders can animate cursor disappearance via iPreviousCursors.
-                    0
-                },
-                prev_cursor_count: cs.prev_multi_cursor_count,
-                time_mode_change: cs.time_mode_change,
-                mouse_pos: cs.mouse_pos,
+                current_cursor_style: cs.cursor_style,
+                previous_cursor_style: cs.previous_cursor_style,
+                current_cursors,
+                previous_cursors,
+                current_cursor_colors,
+                current_cursor_styles,
+                previous_cursor_styles,
+                current_cursor_types,
+                current_cursor_count,
+                previous_cursor_count,
             };
 
             if let Some(pipeline) = self.renderer.custom_shader_pipeline_mut() {
@@ -1178,10 +1250,7 @@ impl Display {
         message_buffer: &MessageBuffer,
         config: &UiConfig,
         search_state: &mut SearchState,
-        mouse_pos: [f32; 2],
     ) {
-        self.cursor_state.mouse_pos = mouse_pos;
-
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
         let mut grid_cells = Vec::new();
@@ -1310,7 +1379,7 @@ impl Display {
         };
 
         // Draw cursor. When multi-cursor protocol is active, the shader handles
-        // all cursor rendering via iCursors[] -- suppress the native cursor rect
+        // all cursor rendering via iCurrentCursors[] -- suppress the native cursor rect
         // to avoid visual overlap.
         if !has_extra_cursors {
             rects.extend(cursor.rects(&size_info, config.cursor.thickness()));

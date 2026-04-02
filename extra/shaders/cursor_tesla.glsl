@@ -78,59 +78,30 @@ const float TAIL_EXTENSION = 1.5;
 // HOLDOUT -- punch out cursor shape from the effect
 const bool CURSOR_HOLDOUT = true;          // true = effect doesn't render on top of cursor
 
-// EFFECT SHAPE -- use cell dimensions instead of cursor shape for the visual effect
-const bool USE_CELL_SHAPE = false;  // true = cell-sized effect, false = follows cursor shape
-
-const bool SKIP_SINGLE_CELL_MOVE = true;     // Skip effect for single-cell moves (typing, arrow keys)
-
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec4 original = texture(iChannel0, fragCoord.xy / iResolution.xy);
     fragColor = original;
 
-    if (iCursorCount == 0 && iCursorVisible == 0.0) {
-        return;
-    }
+    if (iCurrentCursorCount == 0) return;
 
     vec2 vu = norm(fragCoord, 1.);
 
-    int sweepCount = (iCursorCount > 0) ? min(iCursorCount, MAX_CURSORS) : 1;
-    for (int ci = 0; ci < sweepCount; ci++) {
+    int cursorCount = min(iCurrentCursorCount, MAX_CURSORS);
+    for (int ci = 0; ci < cursorCount; ci++) {
 
-    vec4 currentCursor, previousCursor;
-    vec2 cellSize;
-    if (iCursorCount > 0) {
-        currentCursor = vec4(norm(iCursors[ci].xy, 1.), norm(iCursors[ci].zw, 0.));
-        previousCursor = vec4(norm(iPreviousCursors[ci].xy, 1.), norm(iPreviousCursors[ci].zw, 0.));
-        cellSize = currentCursor.zw;  // multi-cursor: zw is already cell-sized
-    } else {
-        currentCursor = vec4(norm(iCurrentCursor.xy, 1.), norm(iCurrentCursor.zw, 0.));
-        previousCursor = vec4(norm(iPreviousCursor.xy, 1.), norm(iPreviousCursor.zw, 0.));
-        cellSize = norm(iCellSize, 0.0);
-    }
+    vec4 currentCursor = vec4(norm(iCurrentCursors[ci].xy, 1.), norm(iCurrentCursors[ci].zw, 0.));
+    vec4 previousCursor = vec4(norm(iPreviousCursors[ci].xy, 1.), norm(iPreviousCursors[ci].zw, 0.));
 
-    vec2 centerCC = cellCenter(currentCursor.xy, cellSize);
-    vec2 centerCP = cellCenter(previousCursor.xy, cellSize);
-    vec2 centerCP_new = centerCP + (centerCP - centerCC) * TAIL_EXTENSION;
+    vec2 currentCenter = cursorCenter(currentCursor.xy, currentCursor.zw);
+    vec2 previousCenter = cursorCenter(previousCursor.xy, previousCursor.zw);
+    vec2 extendedPreviousCenter = previousCenter + (previousCenter - currentCenter) * TAIL_EXTENSION;
 
     float progress = blend(clamp((iTime - iTimeCursorChange) / DURATION, 0.0, 1));
     float easedProgress = ease(progress);
 
-    float lineLength = distance(centerCC, centerCP_new);
+    float lineLength = distance(currentCenter, extendedPreviousCenter);
 
-    // Skip single horizontal cell moves (typing, arrow keys).
-    if (SKIP_SINGLE_CELL_MOVE) {
-        vec2 curPos, prevPos;
-        if (iCursorCount > 0) {
-            curPos = norm(iCursors[ci].xy, 1.0);
-            prevPos = norm(iPreviousCursors[ci].xy, 1.0);
-        } else {
-            curPos = norm(iCurrentCursor.xy, 1.0);
-            prevPos = norm(iPreviousCursor.xy, 1.0);
-        }
-            if (detectJumpCell(curPos, prevPos, cellSize.y, cellSize.x) == 0.0) continue;
-    }
-
-    float distanceToEnd = distance(vu.xy, centerCC);
+    float distanceToEnd = distance(vu.xy, currentCenter);
     float alphaModifier = distanceToEnd / (lineLength * easedProgress);
     if (alphaModifier > 1.0) {
         alphaModifier = 1.0;
@@ -139,7 +110,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float trailOpacity = 1.0 - smoothstep(0.0, 1.0, alphaModifier);
 
     float arcThickness = 0.005 + 0.003 * sin(iTime * 30.0);
-    float arc = electricArc(vu, centerCC, centerCP_new, iTime, easedProgress);
+    float arc = electricArc(vu, currentCenter, extendedPreviousCenter, iTime, easedProgress);
     float arcAlpha = 1.0 - smoothstep(arcThickness * 0.5, arcThickness, arc);
 
     float glow = 1.0 - smoothstep(arcThickness, arcThickness * 2.0, arc);
@@ -153,13 +124,13 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         newColor = mix(newColor, ELECTRIC_COLOR * 0.5, glow * trailOpacity * 0.3);
     }
 
-    vec2 effectSize = USE_CELL_SHAPE ? cellSize : currentCursor.zw;
-    float sdfCursor = sdfRect(vu, cellCenter(currentCursor.xy, effectSize), effectSize * 0.5);
+    vec2 effectSize = currentCursor.zw;
+    float sdfCursor = sdfRect(vu, cursorCenter(currentCursor.xy, effectSize), effectSize * 0.5);
     newColor = mix(newColor, CURRENT_CURSOR_COLOR, 1.0 - smoothstep(0.0, 0.01, sdfCursor));
 
     fragColor = newColor;
 
-    } // end sweepCount loop
+    } // end cursor loop
 
     if (CURSOR_HOLDOUT) {
         fragColor = cursorHoldout(fragColor, original, fragCoord);

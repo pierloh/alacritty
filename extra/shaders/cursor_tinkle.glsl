@@ -212,11 +212,6 @@ const int PATH_SAMPLES = 128;
 // HOLDOUT -- punch out cursor shape from the effect
 const bool CURSOR_HOLDOUT = true;          // true = effect doesn't render on top of cursor
 
-// EFFECT SHAPE -- use cell dimensions instead of cursor shape for the trail brush
-const bool USE_CELL_SHAPE = false;  // true = cell-sized effect, false = follows cursor shape
-
-const bool SKIP_SINGLE_CELL_MOVE = true;     // Skip effect for single-cell moves (typing, arrow keys)
-
 // ============================================================================
 // EASING FUNCTIONS
 // ============================================================================
@@ -376,60 +371,38 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     #endif
 
     // Early exit when no cursor is visible (single-cursor mode only).
-    if (iCursorCount == 0 && iCursorVisible == 0.0) return;
+    if (iCurrentCursorCount == 0) return;
 
     vec2 vu = norm(fragCoord, 1.0);
 
-    int sweepCount = (iCursorCount > 0) ? min(iCursorCount, MAX_CURSORS) : 1;
-    for (int ci = 0; ci < sweepCount; ci++) {
+    int cursorCount = min(iCurrentCursorCount, MAX_CURSORS);
+    for (int ci = 0; ci < cursorCount; ci++) {
 
-    vec4 cur, prev;
-    vec2 cellSize;
-    if (iCursorCount > 0) {
-        cur = vec4(norm(iCursors[ci].xy, 1.0), norm(iCursors[ci].zw, 0.0));
-        prev = vec4(norm(iPreviousCursors[ci].xy, 1.0), norm(iPreviousCursors[ci].zw, 0.0));
-        cellSize = cur.zw;  // multi-cursor: zw is already cell-sized
-    } else {
-        cur = vec4(norm(iCurrentCursor.xy, 1.0), norm(iCurrentCursor.zw, 0.0));
-        prev = vec4(norm(iPreviousCursor.xy, 1.0), norm(iPreviousCursor.zw, 0.0));
-        cellSize = norm(iCellSize, 0.0);
-    }
+    vec4 currentCursor = vec4(norm(iCurrentCursors[ci].xy, 1.0), norm(iCurrentCursors[ci].zw, 0.0));
+    vec4 previousCursor = vec4(norm(iPreviousCursors[ci].xy, 1.0), norm(iPreviousCursors[ci].zw, 0.0));
 
-    vec2 cC = cellCenter(cur.xy, cellSize);
-    vec2 effectSize = USE_CELL_SHAPE ? cellSize : cur.zw;
-    vec2 hC = effectSize * 0.5;
-    vec2 cP = cellCenter(prev.xy, cellSize);
-    vec2 hP = (USE_CELL_SHAPE ? cellSize : prev.zw) * 0.5;
+    vec2 currentCenter = cursorCenter(currentCursor.xy, currentCursor.zw);
+    vec2 currentEffectSize = currentCursor.zw;
+    vec2 currentHalf = currentEffectSize * 0.5;
+    vec2 previousCenter = cursorCenter(previousCursor.xy, previousCursor.zw);
+    vec2 previousHalf = previousCursor.zw * 0.5;
 
-    float sdfCur = sdfRect(vu, cC, hC);
-    vec2 mv = cC - cP;
-    float mL = length(mv);
-    float minD = cellSize.y * MIN_MOVE_DISTANCE;
-    float maxD = cellSize.y * MAX_VALID_MOVE_DISTANCE;
+    float sdfCurrent = sdfRect(vu, currentCenter, currentHalf);
+    vec2 moveVec = currentCenter - previousCenter;
+    float moveLen = length(moveVec);
+    float minD = currentCursor.w * MIN_MOVE_DISTANCE;
+    float maxD = currentCursor.w * MAX_VALID_MOVE_DISTANCE;
 
     vec4 outC = fragColor;
     float timeSince = iTime - iTimeCursorChange;
 
-    bool valid = (mL > minD) && (mL < maxD);
+    bool valid = (moveLen > minD) && (moveLen < maxD);
     bool visible = timeSince < (TAIL_CATCHUP_TIME + LEG_PERSISTENCE);
 
     if (TRAIL_ENABLED > 0.5 && valid && visible) {
 
-        // Skip single horizontal cell moves (typing, arrow keys).
-        if (SKIP_SINGLE_CELL_MOVE) {
-            vec2 curPos, prevPos;
-            if (iCursorCount > 0) {
-                curPos = norm(iCursors[ci].xy, 1.0);
-                prevPos = norm(iPreviousCursors[ci].xy, 1.0);
-            } else {
-                curPos = norm(iCurrentCursor.xy, 1.0);
-                prevPos = norm(iPreviousCursor.xy, 1.0);
-            }
-            if (detectJumpCell(curPos, prevPos, cellSize.y, cellSize.x) == 0.0) continue;
-        }
-
-        float strength = getBendStrength(mL);
-        float id = getMovementId(cP, cC, mL);
+        float strength = getBendStrength(moveLen);
+        float id = getMovementId(previousCenter, currentCenter, moveLen);
 
         float progress = clamp(timeSince / TAIL_CATCHUP_TIME, 0.0, 1.0);
         progress = applyTailEasing(progress);
@@ -443,8 +416,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
                 float t = float(i) / float(PATH_SAMPLES - 1);
                 if (t < tStart || t > tEnd) continue;
 
-                vec2 pathPos = getBentPathPosition(cP, cC, t, strength, id);
-                vec2 pathSize = mix(hP, hC, t) * getTrailSize(t);
+                vec2 pathPos = getBentPathPosition(previousCenter, currentCenter, t, strength, id);
+                vec2 pathSize = mix(previousHalf, currentHalf, t) * getTrailSize(t);
                 float d = sdfRect(vu, pathPos, pathSize);
 
                 if (d < minDist) { minDist = d; bestT = t; }
@@ -484,14 +457,14 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         }
     }
 
-    float curAlpha = step(sdfCur, 0.0);
+    float curAlpha = step(sdfCurrent, 0.0);
     if (curAlpha > 0.001) {
         outC = mix(outC, vec4(TRAIL_COLOR.rgb, CURSOR_ALPHA), curAlpha);
     }
 
     fragColor = outC;
 
-    } // end sweepCount loop
+    } // end cursor loop
 
     if (CURSOR_HOLDOUT) {
         fragColor = cursorHoldout(fragColor, original, fragCoord);

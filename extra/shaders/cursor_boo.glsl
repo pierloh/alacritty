@@ -46,11 +46,6 @@ const float FADE_EXPONENT = 5.0;
 // HOLDOUT -- punch out cursor shape from the effect
 const bool CURSOR_HOLDOUT = true;          // true = effect doesn't render on top of cursor
 
-// EFFECT SHAPE -- cell vs cursor shape for visual rendering
-const bool USE_CELL_SHAPE = false;  // true = cell-sized effect, false = follows cursor shape
-
-const bool SKIP_SINGLE_CELL_MOVE = true;     // Skip effect for single-cell moves (typing, arrow keys)
-
 // --- CONSTANTS ---
 const float PI = 3.14159265359;
 
@@ -143,39 +138,28 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     fragColor = original;
     #endif
 
-    // Early exit when no cursor is visible (single-cursor mode only).
-    if (iCursorCount == 0 && iCursorVisible == 0.0) return;
+    if (iCurrentCursorCount == 0) return;
 
-    // normalization & setup (-1, 1 coords)
     vec2 vu = norm(fragCoord, 1.);
 
-    int sweepCount = (iCursorCount > 0) ? min(iCursorCount, MAX_CURSORS) : 1;
-    for (int ci = 0; ci < sweepCount; ci++) {
+    int cursorCount = min(iCurrentCursorCount, MAX_CURSORS);
+    for (int ci = 0; ci < cursorCount; ci++) {
 
-    vec4 currentCursor, previousCursor;
-    vec2 cellSize;
-    if (iCursorCount > 0) {
-        currentCursor = vec4(norm(iCursors[ci].xy, 1.), norm(iCursors[ci].zw, 0.));
-        previousCursor = vec4(norm(iPreviousCursors[ci].xy, 1.), norm(iPreviousCursors[ci].zw, 0.));
-        cellSize = currentCursor.zw;  // multi-cursor .zw is already cell-sized
-    } else {
-        currentCursor = vec4(norm(iCurrentCursor.xy, 1.), norm(iCurrentCursor.zw, 0.));
-        previousCursor = vec4(norm(iPreviousCursor.xy, 1.), norm(iPreviousCursor.zw, 0.));
-        cellSize = norm(iCellSize, 0.0);  // cell-based coords for movement detection
-    }
+    vec4 currentCursor = vec4(norm(iCurrentCursors[ci].xy, 1.), norm(iCurrentCursors[ci].zw, 0.));
+    vec4 previousCursor = vec4(norm(iPreviousCursors[ci].xy, 1.), norm(iPreviousCursors[ci].zw, 0.));
 
-    vec2 centerCC = cellCenter(currentCursor.xy, cellSize);
-    vec2 effectSizeCC = USE_CELL_SHAPE ? cellSize : currentCursor.zw;
-    vec2 halfSizeCC = effectSizeCC * 0.5;
-    vec2 centerCP = cellCenter(previousCursor.xy, cellSize);
-    vec2 effectSizeCP = USE_CELL_SHAPE ? cellSize : previousCursor.zw;
-    vec2 halfSizeCP = effectSizeCP * 0.5;
+    vec2 currentCenter = cursorCenter(currentCursor.xy, currentCursor.zw);
+    vec2 currentEffectSize = currentCursor.zw;
+    vec2 currentHalf = currentEffectSize * 0.5;
+    vec2 previousCenter = cursorCenter(previousCursor.xy, previousCursor.zw);
+    vec2 previousEffectSize = previousCursor.zw;
+    vec2 previousHalf = previousEffectSize * 0.5;
 
-    float sdfCurrentCursor = sdfRect(vu, centerCC, halfSizeCC);
+    float sdfCurrent = sdfRect(vu, currentCenter, currentHalf);
 
-    float lineLength = distance(centerCC, centerCP);
-    float minDist = cellSize.y * THRESHOLD_MIN_DISTANCE;
-    float maxDist = cellSize.y * MAX_VALID_MOVE_DISTANCE;
+    float lineLength = distance(currentCenter, previousCenter);
+    float minDist = currentCursor.w * THRESHOLD_MIN_DISTANCE;
+    float maxDist = currentCursor.w * MAX_VALID_MOVE_DISTANCE;
 
     vec4 newColor = vec4(fragColor);
     float baseProgress = iTime - iTimeCursorChange;
@@ -190,21 +174,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
 
     if (isValidMovement) {
 
-        // Skip single horizontal cell moves (typing, arrow keys).
-        if (SKIP_SINGLE_CELL_MOVE) {
-            vec2 curPos, prevPos;
-            if (iCursorCount > 0) {
-                curPos = norm(iCursors[ci].xy, 1.0);
-                prevPos = norm(iPreviousCursors[ci].xy, 1.0);
-            } else {
-                curPos = norm(iCurrentCursor.xy, 1.0);
-                prevPos = norm(iPreviousCursor.xy, 1.0);
-            }
-            if (detectJumpCell(curPos, prevPos, cellSize.y, cellSize.x) == 0.0) continue;
-        }
-
         if (SMEAR_ENABLED > 0.5) {
-            vec2 moveVec = centerCC - centerCP;
+            vec2 moveVec = currentCenter - previousCenter;
             float moveLength = length(moveVec);
             
             if (moveLength > 0.0001) {
@@ -215,15 +186,15 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
                 float easedT = easeInOut(t);
                 
                 // === Get FIXED corner positions for this leg ===
-                vec2 tl_beg = getTopLeft(centerCP, halfSizeCP);
-                vec2 tr_beg = getTopRight(centerCP, halfSizeCP);
-                vec2 bl_beg = getBottomLeft(centerCP, halfSizeCP);
-                vec2 br_beg = getBottomRight(centerCP, halfSizeCP);
+                vec2 tl_beg = getTopLeft(previousCenter, previousHalf);
+                vec2 tr_beg = getTopRight(previousCenter, previousHalf);
+                vec2 bl_beg = getBottomLeft(previousCenter, previousHalf);
+                vec2 br_beg = getBottomRight(previousCenter, previousHalf);
                 
-                vec2 tl_end = getTopLeft(centerCC, halfSizeCC);
-                vec2 tr_end = getTopRight(centerCC, halfSizeCC);
-                vec2 bl_end = getBottomLeft(centerCC, halfSizeCC);
-                vec2 br_end = getBottomRight(centerCC, halfSizeCC);
+                vec2 tl_end = getTopLeft(currentCenter, currentHalf);
+                vec2 tr_end = getTopRight(currentCenter, currentHalf);
+                vec2 bl_end = getBottomLeft(currentCenter, currentHalf);
+                vec2 br_end = getBottomRight(currentCenter, currentHalf);
                 
                 // === Detect primary movement direction ===
                 float absX = abs(moveVec.x);
@@ -322,54 +293,54 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
                 
                 // Keep cursor opaque during animation (no blink hole)
                 if (animationActive) {
-                    float cursorAlpha = step(sdfCurrentCursor, 0.0);
+                    float cursorAlpha = step(sdfCurrent, 0.0);
                     newColor = mix(newColor, vec4(TRAIL_COLOR.rgb, 1.0), cursorAlpha);
                 } else {
-                    newColor = mix(newColor, fragColor, step(sdfCurrentCursor, 0.0));
+                    newColor = mix(newColor, fragColor, step(sdfCurrent, 0.0));
                 }
             }
         } 
         // === ORIGINAL WARP TRAIL MODE (fallback) ===
         else {
-            float cc_half_height = effectSizeCC.y * 0.5;
-            float cc_center_y = centerCC.y;
-            float cc_new_half_height = cc_half_height * TRAIL_THICKNESS;
-            float cc_new_top_y = cc_center_y + cc_new_half_height;
-            float cc_new_bottom_y = cc_center_y - cc_new_half_height;
+            float cur_half_height = currentEffectSize.y * 0.5;
+            float cur_center_y = currentCenter.y;
+            float cur_new_half_height = cur_half_height * TRAIL_THICKNESS;
+            float cur_new_top_y = cur_center_y + cur_new_half_height;
+            float cur_new_bottom_y = cur_center_y - cur_new_half_height;
 
-            float cc_half_width = effectSizeCC.x * 0.5;
-            float cc_center_x = centerCC.x;
-            float cc_new_half_width = cc_half_width * TRAIL_THICKNESS_X;
-            float cc_new_left_x = cc_center_x - cc_new_half_width;
-            float cc_new_right_x = cc_center_x + cc_new_half_width;
+            float cur_half_width = currentEffectSize.x * 0.5;
+            float cur_center_x = currentCenter.x;
+            float cur_new_half_width = cur_half_width * TRAIL_THICKNESS_X;
+            float cur_new_left_x = cur_center_x - cur_new_half_width;
+            float cur_new_right_x = cur_center_x + cur_new_half_width;
 
-            vec2 cc_tl = vec2(cc_new_left_x, cc_new_top_y);
-            vec2 cc_tr = vec2(cc_new_right_x, cc_new_top_y);
-            vec2 cc_bl = vec2(cc_new_left_x, cc_new_bottom_y);
-            vec2 cc_br = vec2(cc_new_right_x, cc_new_bottom_y);
+            vec2 cur_tl = vec2(cur_new_left_x, cur_new_top_y);
+            vec2 cur_tr = vec2(cur_new_right_x, cur_new_top_y);
+            vec2 cur_bl = vec2(cur_new_left_x, cur_new_bottom_y);
+            vec2 cur_br = vec2(cur_new_right_x, cur_new_bottom_y);
 
-            float cp_half_height = effectSizeCP.y * 0.5;
-            float cp_center_y = centerCP.y;
-            float cp_new_half_height = cp_half_height * TRAIL_THICKNESS;
-            float cp_new_top_y = cp_center_y + cp_new_half_height;
-            float cp_new_bottom_y = cp_center_y - cp_half_height;
+            float prev_half_height = previousEffectSize.y * 0.5;
+            float prev_center_y = previousCenter.y;
+            float prev_new_half_height = prev_half_height * TRAIL_THICKNESS;
+            float prev_new_top_y = prev_center_y + prev_new_half_height;
+            float prev_new_bottom_y = prev_center_y - prev_half_height;
 
-            float cp_half_width = effectSizeCP.x * 0.5;
-            float cp_center_x = centerCP.x;
-            float cp_new_half_width = cp_half_width * TRAIL_THICKNESS_X;
-            float cp_new_left_x = cp_center_x - cp_new_half_width;
-            float cp_new_right_x = cp_center_x + cp_new_half_width;
+            float prev_half_width = previousEffectSize.x * 0.5;
+            float prev_center_x = previousCenter.x;
+            float prev_new_half_width = prev_half_width * TRAIL_THICKNESS_X;
+            float prev_new_left_x = prev_center_x - prev_new_half_width;
+            float prev_new_right_x = prev_center_x + prev_new_half_width;
 
-            vec2 cp_tl = vec2(cp_new_left_x, cp_new_top_y);
-            vec2 cp_tr = vec2(cp_new_right_x, cp_new_top_y);
-            vec2 cp_bl = vec2(cp_new_left_x, cp_new_bottom_y);
-            vec2 cp_br = vec2(cp_new_right_x, cp_new_bottom_y);
+            vec2 prev_tl = vec2(prev_new_left_x, prev_new_top_y);
+            vec2 prev_tr = vec2(prev_new_right_x, prev_new_top_y);
+            vec2 prev_bl = vec2(prev_new_left_x, prev_new_bottom_y);
+            vec2 prev_br = vec2(prev_new_right_x, prev_new_bottom_y);
 
             const float DURATION_TRAIL = DURATION;
             const float DURATION_LEAD = DURATION * (1.0 - TRAIL_SIZE);
             const float DURATION_SIDE = (DURATION_LEAD + DURATION_TRAIL) / 2.0;
 
-            vec2 moveVec = centerCC - centerCP;
+            vec2 moveVec = currentCenter - previousCenter;
             vec2 s = sign(moveVec);
 
             float dot_tl = dot(vec2(-1., 1.), s);
@@ -402,14 +373,14 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
             float prog_bl = easeInOut(clamp(baseProgress / final_dur_bl, 0.0, 1.0));
             float prog_br = easeInOut(clamp(baseProgress / final_dur_br, 0.0, 1.0));
 
-            vec2 v_tl = mix(cp_tl, cc_tl, prog_tl);
-            vec2 v_tr = mix(cp_tr, cc_tr, prog_tr);
-            vec2 v_br = mix(cp_br, cc_br, prog_br);
-            vec2 v_bl = mix(cp_bl, cc_bl, prog_bl);
+            vec2 v_tl = mix(prev_tl, cur_tl, prog_tl);
+            vec2 v_tr = mix(prev_tr, cur_tr, prog_tr);
+            vec2 v_br = mix(prev_br, cur_br, prog_br);
+            vec2 v_bl = mix(prev_bl, cur_bl, prog_bl);
 
             float sdfTrail = sdfQuad(vu, v_tl, v_tr, v_br, v_bl);
 
-            vec2 fragVec = vu - centerCP;
+            vec2 fragVec = vu - previousCenter;
             float fadeProgress = clamp(dot(fragVec, moveVec) / (dot(moveVec, moveVec) + 1e-6), 0.0, 1.0);
 
             vec4 trail = TRAIL_COLOR;
@@ -431,17 +402,17 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
         }
 
         if (animationActive) {
-            float cursorAlpha = step(sdfCurrentCursor, 0.0);
+            float cursorAlpha = step(sdfCurrent, 0.0);
             newColor = mix(newColor, vec4(TRAIL_COLOR.rgb, 1.0), cursorAlpha);
         } else {
-            newColor = mix(newColor, fragColor, step(sdfCurrentCursor, 0.0));
+            newColor = mix(newColor, fragColor, step(sdfCurrent, 0.0));
         }
 
     }
 
     fragColor = newColor;
 
-    } // end sweepCount loop
+    } // end cursor loop
 
     if (CURSOR_HOLDOUT) {
         fragColor = cursorHoldout(fragColor, original, fragCoord);
