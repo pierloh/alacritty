@@ -1020,9 +1020,20 @@ impl Display {
             let mut previous_cursor_styles = [0i32; MAX_MULTI_CURSORS];
             let mut current_cursor_types = [0i32; MAX_MULTI_CURSORS];
 
+            // When cursor is hidden (DECTCEM off) and multi-cursors exist, the
+            // native cursor position is unreliable: multiplexers move it during
+            // content rendering without sending CUP when DECTCEM is off. Use
+            // the first multi-cursor position for index 0 instead.
+            let use_multi_as_primary = !cs.app_visible && cs.multi_cursor_count > 0;
+
             // Index 0: primary cursor (always populated for previous-position data).
-            current_cursors[0] = cs.current;
-            previous_cursors[0] = cs.previous;
+            if use_multi_as_primary {
+                current_cursors[0] = cs.multi_cursors[0];
+                previous_cursors[0] = cs.previous_multi_cursors[0];
+            } else {
+                current_cursors[0] = cs.current;
+                previous_cursors[0] = cs.previous;
+            }
             current_cursor_colors[0] = cs.color;
             current_cursor_styles[0] = cs.cursor_style;
             previous_cursor_styles[0] = cs.previous_cursor_style;
@@ -1030,32 +1041,47 @@ impl Display {
 
             // Indices 1+: secondary cursors from kitty multi-cursor protocol.
             // Secondary cursors share the primary cursor's color and style.
+            // When using multi-cursor as primary, skip the first one (already at index 0).
             let sec = cs.multi_cursor_count.max(0) as usize;
             let previous_sec = cs.previous_multi_cursor_count.max(0) as usize;
+            let start = if use_multi_as_primary { 1 } else { 0 };
             let max_sec = sec.max(previous_sec).min(MAX_MULTI_CURSORS - 1);
-            for i in 0..max_sec {
+            for i in start..max_sec {
                 if i < sec {
-                    current_cursors[1 + i] = cs.multi_cursors[i];
-                    current_cursor_colors[1 + i] = cs.color;
-                    current_cursor_styles[1 + i] = cs.cursor_style;
-                    current_cursor_types[1 + i] = cs.multi_cursor_types[i];
+                    current_cursors[1 + i - start] = cs.multi_cursors[i];
+                    current_cursor_colors[1 + i - start] = cs.color;
+                    current_cursor_styles[1 + i - start] = cs.cursor_style;
+                    current_cursor_types[1 + i - start] = cs.multi_cursor_types[i];
                 }
-                if i < previous_sec {
-                    previous_cursors[1 + i] = cs.previous_multi_cursors[i];
-                }
-                previous_cursor_styles[1 + i] = cs.previous_cursor_style;
+                // Always populate previous from the array -- new entries are
+                // initialized to their current position in update_custom_shader_state
+                // (lines 1020-1026), so this is safe for all indices in range.
+                previous_cursors[1 + i - start] = cs.previous_multi_cursors[i];
+                previous_cursor_styles[1 + i - start] = cs.previous_cursor_style;
             }
 
             // Per spec: extra cursors share main cursor's blink state, but
             // main cursor visibility (DECTCEM) does not affect extra cursors.
             // Blink-off = !visible && app_visible. DECTCEM-off = !app_visible.
+            //
+            // When using multi-cursor as primary (start=1), one multi-cursor
+            // was consumed into index 0, so subtract it from the count.
+            let start_i32 = start as i32;
             let (current_cursor_count, previous_cursor_count) =
-                if cs.visible || !cs.app_visible {
-                    (1 + cs.multi_cursor_count, 1 + cs.previous_multi_cursor_count)
+                if cs.visible || (!cs.app_visible && cs.multi_cursor_count > 0) {
+                    // Cursor visible, or DECTCEM off with multi-cursor data.
+                    (
+                        1 + cs.multi_cursor_count - start_i32,
+                        1 + cs.previous_multi_cursor_count - start_i32,
+                    )
+                } else if !cs.app_visible {
+                    // DECTCEM off, no multi-cursors: native cursor position is
+                    // unreliable (multiplexer content rendering moves it).
+                    (0, 0)
                 } else {
                     // Blink-off: suppress current cursors but keep previous_cursor_count
                     // so shaders can animate cursor disappearance via iPreviousCursors.
-                    (0, 1 + cs.previous_multi_cursor_count)
+                    (0, 1 + cs.previous_multi_cursor_count - start_i32)
                 };
 
             let uniforms = ShaderUniforms {
@@ -1063,8 +1089,8 @@ impl Display {
                 time,
                 time_cursor_change: cs.time_cursor_change,
                 time_mode_change: cs.time_mode_change,
-                current_cursor: cs.current,
-                previous_cursor: cs.previous,
+                current_cursor: current_cursors[0],
+                previous_cursor: previous_cursors[0],
                 current_cursor_color: cs.color,
                 previous_cursor_color: cs.previous_color,
                 cursor_visible: if cs.visible { 1.0 } else { 0.0 },
