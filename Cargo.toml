@@ -21,4 +21,5 @@ toml = "0.9.11"
 toml_edit = "0.24.0"
 
 [patch.crates-io]
+crossfont = { path = "deps/crossfont" }
 vte = { path = "deps/vte" }

@@ -30,6 +30,7 @@ pub mod rects;
 mod shader;
 mod text;
 
+pub use text::shaping::Shaper;
 pub use text::{GlyphCache, LoaderApi};
 
 use shader::ShaderVersion;
@@ -184,6 +185,11 @@ impl Renderer {
         })
     }
 
+    /// Whether the renderer uses the GLSL3 backend (required for ligature span encoding).
+    pub fn is_glsl3(&self) -> bool {
+        matches!(self.text_renderer, TextRendererProvider::Glsl3(_))
+    }
+
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
         &mut self,
         size_info: &SizeInfo,
@@ -227,6 +233,9 @@ impl Renderer {
             Some(RenderableCell {
                 point: Point::new(point.line, point.column + i),
                 character,
+                glyph_index: None,
+                cell_span: 1,
+                is_ligature: false,
                 extra: None,
                 flags,
                 bg_alpha: 1.0,

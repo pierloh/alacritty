@@ -25,6 +25,7 @@ uniform vec4 projection;
 
 uniform int renderingPass;
 
+#define COLORED 1
 #define WIDE_CHAR 2
 
 void main() {
@@ -42,15 +43,19 @@ void main() {
     fg = vec4(textColor.rgb / 255.0, textColor.a);
     bg = backgroundColor / 255.0;
 
-    float occupiedCells = 1;
-    if ((int(fg.a) >= WIDE_CHAR)) {
-        // Update wide char x dimension so it'll cover the following spacer.
-        occupiedCells = 2;
+    // Extract cell span from bits 2-4 of the flags byte (1-8 cells).
+    // Round to avoid float truncation drift (e.g. int(4.999) -> 4).
+    int flags = int(fg.a + 0.5);
+    int cellSpan = max(1, (flags >> 2) & 0x7);
+    float occupiedCells = float(cellSpan);
 
-        // Since we don't perform bitwise operations due to limitations of
-        // the GLES2 renderer,we subtract wide char bits keeping only colored.
-        fg.a = round(fg.a - WIDE_CHAR);
+    // For backward compat: if no span encoded but WIDE_CHAR flag set, use 2.
+    if (cellSpan <= 1 && (flags & WIDE_CHAR) != 0) {
+        occupiedCells = 2.0;
     }
+
+    // Strip span and WIDE_CHAR bits, keeping only COLORED.
+    fg.a = float(flags & COLORED);
 
     if (renderingPass == 0) {
         vec2 backgroundDim = cellDim;

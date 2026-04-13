@@ -42,6 +42,10 @@ pub struct Font {
 
     /// Whether to use the built-in font for box drawing characters.
     pub builtin_box_drawing: bool,
+
+    /// OpenType features to enable during shaping (e.g. `["calt", "liga"]`).
+    /// Empty list disables shaping entirely.
+    pub features: Vec<String>,
 }
 
 impl Font {
@@ -80,6 +84,7 @@ impl Default for Font {
     fn default() -> Font {
         Self {
             builtin_box_drawing: true,
+            features: Default::default(),
             glyph_offset: Default::default(),
             use_thin_strokes: Default::default(),
             bold_italic: Default::default(),

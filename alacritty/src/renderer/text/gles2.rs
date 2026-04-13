@@ -291,7 +291,14 @@ impl TextRenderBatch for Batch {
             RenderingGlyphFlags::empty()
         };
 
-        let is_wide = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+        // Use cell_span for ligatures, fall back to wide char check.
+        let cell_width_factor = if cell.cell_span > 1 {
+            cell.cell_span as i16
+        } else if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
 
         let mut vertex = TextVertex {
             x,
@@ -320,13 +327,13 @@ impl TextRenderBatch for Batch {
         vertex.v = glyph.uv_bot;
         self.vertices.push(vertex);
 
-        vertex.x = x + is_wide * size_info.cell_width() as i16;
+        vertex.x = x + cell_width_factor * size_info.cell_width() as i16;
         vertex.glyph_x = glyph_x + glyph.width;
         vertex.u = glyph.uv_left + glyph.uv_width;
         vertex.v = glyph.uv_bot;
         self.vertices.push(vertex);
 
-        vertex.x = x + is_wide * size_info.cell_width() as i16;
+        vertex.x = x + cell_width_factor * size_info.cell_width() as i16;
         vertex.y = y + size_info.cell_height() as i16;
         vertex.glyph_x = glyph_x + glyph.width;
         vertex.glyph_y = glyph_y + glyph.height;

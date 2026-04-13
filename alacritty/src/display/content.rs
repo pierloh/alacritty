@@ -188,6 +188,9 @@ impl Iterator for RenderableContent<'_> {
 #[derive(Clone, Debug)]
 pub struct RenderableCell {
     pub character: char,
+    pub glyph_index: Option<u32>,
+    pub cell_span: u8,
+    pub is_ligature: bool,
     pub point: Point<usize>,
     pub fg: Rgb,
     pub bg: Rgb,
@@ -295,7 +298,19 @@ impl RenderableCell {
             })
         });
 
-        RenderableCell { flags, character, bg_alpha, point, fg, bg, underline, extra }
+        RenderableCell {
+            flags,
+            character,
+            glyph_index: None,
+            cell_span: 1,
+            is_ligature: false,
+            bg_alpha,
+            point,
+            fg,
+            bg,
+            underline,
+            extra,
+        }
     }
 
     /// Check if cell contains any renderable content.
