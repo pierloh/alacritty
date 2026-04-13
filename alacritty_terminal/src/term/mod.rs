@@ -50,6 +50,42 @@ const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
 /// Default tab interval, corresponding to terminfo `it` value.
 const INITIAL_TABSTOPS: usize = 8;
 
+/// Maximum number of multi-cursors supported in the shader pipeline.
+pub const MAX_MULTI_CURSORS: usize = 64;
+
+/// Cursor position from the kitty multi-cursor protocol (CSI > ... SP q).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiCursorInfo {
+    pub row: u16,
+    pub col: u16,
+}
+
+/// Color specification for extra cursors (kitty multi-cursor protocol shapes 30, 40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtraCursorColor {
+    /// Unset -- match main cursor.
+    #[default]
+    Unset,
+    /// Reverse video effect.
+    Special,
+    /// sRGB color.
+    Rgb(u8, u8, u8),
+    /// Indexed palette color.
+    Indexed(u8),
+}
+
+/// Full state for the kitty multi-cursor protocol.
+#[derive(Debug, Clone, Default)]
+pub struct MultiCursorState {
+    pub cursors: Vec<MultiCursorInfo>,
+    /// Shape value from the protocol (1-3, 29). 0 means cleared.
+    pub shape: u8,
+    /// Text color under extra cursors (shape 30).
+    pub text_color: ExtraCursorColor,
+    /// Extra cursor color (shape 40).
+    pub cursor_color: ExtraCursorColor,
+}
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct TermMode: u32 {
@@ -327,6 +363,9 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// State for the kitty multi-cursor protocol.
+    multi_cursor_state: MultiCursorState,
 }
 
 /// Configuration options for the [`Term`].
@@ -441,6 +480,7 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
+            multi_cursor_state: MultiCursorState::default(),
         }
     }
 
@@ -651,6 +691,16 @@ impl<T> Term<T> {
         &mut self.grid
     }
 
+    /// Multi-cursor positions from kitty multi-cursor protocol.
+    pub fn multi_cursors(&self) -> &[MultiCursorInfo] {
+        &self.multi_cursor_state.cursors
+    }
+
+    /// Full multi-cursor protocol state.
+    pub fn multi_cursor_state(&self) -> &MultiCursorState {
+        &self.multi_cursor_state
+    }
+
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
         let old_cols = self.columns();
@@ -702,6 +752,9 @@ impl<T> Term<T> {
 
         // Resize damage information.
         self.damage.resize(num_cols, num_lines);
+
+        // Stale positions invalid after resize; client will re-send.
+        self.multi_cursor_state = MultiCursorState::default();
     }
 
     /// Active terminal modes.
@@ -731,6 +784,8 @@ impl<T> Term<T> {
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
+        // Stale positions invalid after screen change; client will re-send.
+        self.multi_cursor_state = MultiCursorState::default();
         self.mark_fully_damaged();
     }
 
@@ -1053,6 +1108,127 @@ impl<T> Dimensions for Term<T> {
     #[inline]
     fn total_lines(&self) -> usize {
         self.grid.total_lines()
+    }
+}
+
+/// Parse kitty multi-cursor CSI parameters into cursor positions.
+///
+/// Params format: first param = [shape], subsequent = [coord_type, y, x] for type 2.
+/// Coordinates are 1-indexed.
+///
+/// Shape values per kitty multi-cursor protocol:
+///   0 = clear all cursors, 1 = block, 2 = beam, 3 = underline,
+///   29 = follow main cursor shape.
+///
+/// Parse coordinate groups from kitty multi-cursor protocol params.
+/// Handles types 0 (main cursor), 2 (points), and 4 (rectangles).
+/// The `cursor_point` is needed to resolve type 0 references.
+fn parse_multi_cursor_coords(
+    params: &[&[u16]],
+    cursor_point: (u16, u16),
+    screen_lines: u16,
+    columns: u16,
+) -> Vec<MultiCursorInfo> {
+    let mut cursors = Vec::with_capacity(params.len());
+
+    for param in params {
+        if param.is_empty() {
+            continue;
+        }
+
+        let coord_type = param[0];
+
+        match coord_type {
+            // Type 0: main cursor position.
+            0 => {
+                cursors.push(MultiCursorInfo { row: cursor_point.0, col: cursor_point.1 });
+            },
+            // Type 2: point coordinates as y:x pairs (1-indexed).
+            // Out-of-bounds coordinates are silently skipped per spec.
+            2 => {
+                let coords = &param[1..];
+                for chunk in coords.chunks(2) {
+                    if chunk.len() == 2
+                        && chunk[0] > 0
+                        && chunk[1] > 0
+                        && chunk[0] <= screen_lines
+                        && chunk[1] <= columns
+                    {
+                        cursors.push(MultiCursorInfo {
+                            row: chunk[0] - 1,
+                            col: chunk[1] - 1,
+                        });
+                    }
+                }
+            },
+            // Type 4: rectangle as top:left:bottom:right (1-indexed).
+            // Empty params = full screen.
+            4 => {
+                let coords = &param[1..];
+                if coords.is_empty() {
+                    // Full screen rectangle.
+                    for row in 0..screen_lines.min(MAX_MULTI_CURSORS as u16) {
+                        for col in 0..columns {
+                            cursors.push(MultiCursorInfo { row, col });
+                            if cursors.len() >= MAX_MULTI_CURSORS {
+                                break;
+                            }
+                        }
+                        if cursors.len() >= MAX_MULTI_CURSORS {
+                            break;
+                        }
+                    }
+                } else {
+                    for rect in coords.chunks(4) {
+                        if rect.len() == 4 && rect[0] > 0 && rect[1] > 0 && rect[2] > 0 && rect[3] > 0 {
+                            let top = (rect[0] - 1).min(screen_lines.saturating_sub(1));
+                            let left = (rect[1] - 1).min(columns.saturating_sub(1));
+                            let bottom = (rect[2] - 1).min(screen_lines.saturating_sub(1));
+                            let right = (rect[3] - 1).min(columns.saturating_sub(1));
+                            for row in top..=bottom {
+                                for col in left..=right {
+                                    cursors.push(MultiCursorInfo { row, col });
+                                    if cursors.len() >= MAX_MULTI_CURSORS {
+                                        break;
+                                    }
+                                }
+                                if cursors.len() >= MAX_MULTI_CURSORS {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+
+        if cursors.len() >= MAX_MULTI_CURSORS {
+            cursors.truncate(MAX_MULTI_CURSORS);
+            break;
+        }
+    }
+
+    cursors
+}
+
+/// Parse color specification from kitty multi-cursor protocol (shapes 30, 40).
+fn parse_extra_cursor_color(params: &[&[u16]]) -> ExtraCursorColor {
+    if params.is_empty() {
+        return ExtraCursorColor::Unset;
+    }
+    let first = params[0];
+    if first.is_empty() {
+        return ExtraCursorColor::Unset;
+    }
+    let color_space = first[0];
+    let args = &first[1..];
+    match color_space {
+        0 => ExtraCursorColor::Unset,
+        1 => ExtraCursorColor::Special,
+        2 if args.len() >= 3 => ExtraCursorColor::Rgb(args[0] as u8, args[1] as u8, args[2] as u8),
+        5 if !args.is_empty() => ExtraCursorColor::Indexed(args[0] as u8),
+        _ => ExtraCursorColor::Unset,
     }
 }
 
@@ -1784,6 +1960,13 @@ impl<T: EventListener> Handler for Term<T> {
 
                 let range = cursor.line..Line(screen_lines as i32);
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+
+                // Multiplexers (Zellij) use cursor-home + ED 0 instead of ED 2
+                // for tab switches. Clear stale multi-cursor state from the
+                // previous pane; the new pane will re-send if needed.
+                if cursor.line.0 == 0 && cursor.column.0 == 0 {
+                    self.multi_cursor_state = MultiCursorState::default();
+                }
             },
             ansi::ClearMode::All => {
                 if self.mode.contains(TermMode::ALT_SCREEN) {
@@ -1801,6 +1984,7 @@ impl<T: EventListener> Handler for Term<T> {
                 }
 
                 self.selection = None;
+                self.multi_cursor_state = MultiCursorState::default();
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
                 self.grid.clear_history();
@@ -1809,9 +1993,15 @@ impl<T: EventListener> Handler for Term<T> {
                     self.vi_mode_cursor.point.line.grid_clamp(self, Boundary::Cursor);
 
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(..Line(0)));
+                self.multi_cursor_state = MultiCursorState::default();
             },
             // We have no history to clear.
             ansi::ClearMode::Saved => (),
+            // Kitty ED 22: clear screen and scrollback.
+            ansi::ClearMode::AllAndSaved => {
+                self.clear_screen(ansi::ClearMode::All);
+                self.clear_screen(ansi::ClearMode::Saved);
+            },
         }
 
         self.mark_fully_damaged();
@@ -1848,6 +2038,8 @@ impl<T: EventListener> Handler for Term<T> {
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
+        // Stale positions invalid after screen change; client will re-send.
+        self.multi_cursor_state = MultiCursorState::default();
 
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
@@ -1874,6 +2066,83 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
         trace!("Setting hyperlink: {hyperlink:?}");
         self.grid.cursor.template.set_hyperlink(hyperlink.map(|e| e.into()));
+    }
+
+    fn set_extra_cursors(&mut self, params: &[&[u16]]) {
+        // Support detection query: CSI > SP q (no params).
+        if params.is_empty() {
+            // Respond with supported shapes.
+            let reply = "\x1b[>1;2;3;29;30;40;100;101 q";
+            self.event_proxy.send_event(Event::PtyWrite(reply.into()));
+            return;
+        }
+
+        let shape = params[0].first().copied().unwrap_or(0);
+        let cursor_point = (
+            self.grid.cursor.point.line.0 as u16,
+            self.grid.cursor.point.column.0 as u16,
+        );
+        let screen_lines = self.screen_lines() as u16;
+        let columns = self.columns() as u16;
+
+        match shape {
+            // Shape 0: clear all extra cursors.
+            0 => {
+                self.multi_cursor_state = MultiCursorState::default();
+            },
+            // Shapes 1-3, 29: set cursor positions.
+            1..=3 | 29 => {
+                let cursors = parse_multi_cursor_coords(
+                    &params[1..],
+                    cursor_point,
+                    screen_lines,
+                    columns,
+                );
+                self.multi_cursor_state.cursors = cursors;
+                self.multi_cursor_state.shape = shape as u8;
+            },
+            // Shape 30: set text color under extra cursors.
+            30 => {
+                self.multi_cursor_state.text_color = parse_extra_cursor_color(&params[1..]);
+            },
+            // Shape 40: set extra cursor color.
+            40 => {
+                self.multi_cursor_state.cursor_color = parse_extra_cursor_color(&params[1..]);
+            },
+            // Shape 100: query currently set cursors.
+            100 => {
+                use std::fmt::Write;
+                let state = &self.multi_cursor_state;
+                let mut reply = String::from("\x1b[>100");
+                if !state.cursors.is_empty() {
+                    let _ = write!(reply, ";{}:2", state.shape);
+                    for c in &state.cursors {
+                        let _ = write!(reply, ":{}:{}", c.row + 1, c.col + 1);
+                    }
+                }
+                reply.push_str(" q");
+                self.event_proxy.send_event(Event::PtyWrite(reply.into()));
+            },
+            // Shape 101: query extra cursor colors.
+            101 => {
+                use std::fmt::Write;
+                let mut reply = String::from("\x1b[>101");
+                let fmt_color = |c: &ExtraCursorColor| -> String {
+                    match c {
+                        ExtraCursorColor::Unset => "0".to_string(),
+                        ExtraCursorColor::Special => "1".to_string(),
+                        ExtraCursorColor::Rgb(r, g, b) => format!("2:{}:{}:{}", r, g, b),
+                        ExtraCursorColor::Indexed(i) => format!("5:{}", i),
+                    }
+                };
+                let _ = write!(reply, ";30:{};40:{}", fmt_color(&self.multi_cursor_state.text_color), fmt_color(&self.multi_cursor_state.cursor_color));
+                reply.push_str(" q");
+                self.event_proxy.send_event(Event::PtyWrite(reply.into()));
+            },
+            _ => {
+                debug!("Unhandled kitty extra cursor shape: {}", shape);
+            },
+        }
     }
 
     /// Set a terminal attribute.
@@ -3298,5 +3567,127 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+}
+
+#[cfg(test)]
+mod multi_cursor_tests {
+    use super::*;
+
+    const CURSOR: (u16, u16) = (5, 10); // row=5, col=10 (0-indexed)
+    const LINES: u16 = 24;
+    const COLS: u16 = 80;
+
+    fn parse(params: &[&[u16]]) -> Vec<MultiCursorInfo> {
+        parse_multi_cursor_coords(params, CURSOR, LINES, COLS)
+    }
+
+    #[test]
+    fn type2_single_cursor() {
+        let result = parse(&[&[2, 4, 5]]);
+        assert_eq!(result, vec![MultiCursorInfo { row: 3, col: 4 }]);
+    }
+
+    #[test]
+    fn type2_multiple_cursors() {
+        let result = parse(&[&[2, 7, 1], &[2, 7, 3]]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], MultiCursorInfo { row: 6, col: 0 });
+        assert_eq!(result[1], MultiCursorInfo { row: 6, col: 2 });
+    }
+
+    #[test]
+    fn type2_packed_points() {
+        let result = parse(&[&[2, 7, 5, 7, 7]]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], MultiCursorInfo { row: 6, col: 4 });
+        assert_eq!(result[1], MultiCursorInfo { row: 6, col: 6 });
+    }
+
+    #[test]
+    fn type2_zero_coords_skipped() {
+        let result = parse(&[&[2, 0, 5]]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn type2_odd_trailing_ignored() {
+        let result = parse(&[&[2, 4, 5, 8]]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], MultiCursorInfo { row: 3, col: 4 });
+    }
+
+    #[test]
+    fn type2_truncates_at_64() {
+        // Pack multiple in-bounds coordinates per param to exceed 64.
+        // Screen is 24x80, so use columns 1..=65 on row 1.
+        let mut params: Vec<Vec<u16>> = Vec::new();
+        for c in 1..=65 {
+            params.push(vec![2, 1, c]);
+        }
+        let refs: Vec<&[u16]> = params.iter().map(|p| p.as_slice()).collect();
+        let result = parse_multi_cursor_coords(&refs, CURSOR, LINES, COLS);
+        assert_eq!(result.len(), 64);
+    }
+
+    #[test]
+    fn type2_out_of_bounds_filtered() {
+        // Row 25 on a 24-line screen should be silently skipped.
+        let result = parse(&[&[2, 25, 1]]);
+        assert!(result.is_empty());
+        // Column 81 on an 80-column screen should be silently skipped.
+        let result = parse(&[&[2, 1, 81]]);
+        assert!(result.is_empty());
+        // Boundary values should work.
+        let result = parse(&[&[2, 24, 80]]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], MultiCursorInfo { row: 23, col: 79 });
+    }
+
+    #[test]
+    fn type0_main_cursor() {
+        let result = parse(&[&[0]]);
+        assert_eq!(result, vec![MultiCursorInfo { row: CURSOR.0, col: CURSOR.1 }]);
+    }
+
+    #[test]
+    fn type4_rectangle() {
+        // Rectangle top=2,left=3,bottom=4,right=5 (1-indexed)
+        let result = parse(&[&[4, 2, 3, 4, 5]]);
+        // Should enumerate (1,2),(1,3),(1,4), (2,2),(2,3),(2,4), (3,2),(3,3),(3,4)
+        assert_eq!(result.len(), 9);
+        assert_eq!(result[0], MultiCursorInfo { row: 1, col: 2 });
+        assert_eq!(result[8], MultiCursorInfo { row: 3, col: 4 });
+    }
+
+    #[test]
+    fn type4_incomplete_ignored() {
+        // Only 3 values -- not a multiple of 4.
+        let result = parse(&[&[4, 2, 3, 4]]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn color_parse_rgb() {
+        let params: Vec<&[u16]> = vec![&[2, 255, 128, 0]];
+        assert_eq!(parse_extra_cursor_color(&params), ExtraCursorColor::Rgb(255, 128, 0));
+    }
+
+    #[test]
+    fn color_parse_indexed() {
+        let params: Vec<&[u16]> = vec![&[5, 42]];
+        assert_eq!(parse_extra_cursor_color(&params), ExtraCursorColor::Indexed(42));
+    }
+
+    #[test]
+    fn color_parse_special() {
+        let params: Vec<&[u16]> = vec![&[1]];
+        assert_eq!(parse_extra_cursor_color(&params), ExtraCursorColor::Special);
+    }
+
+    #[test]
+    fn color_parse_unset() {
+        let params: Vec<&[u16]> = vec![&[0]];
+        assert_eq!(parse_extra_cursor_color(&params), ExtraCursorColor::Unset);
     }
 }

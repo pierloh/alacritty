@@ -6,6 +6,8 @@ use serde::Serialize;
 
 use alacritty_config_derive::ConfigDeserialize;
 
+use crate::config::ui_config::CustomShaderPaths;
+
 /// General config section.
 ///
 /// This section is for fields which can not be easily categorized,
@@ -27,6 +29,10 @@ pub struct General {
     /// Offer IPC through a unix socket.
     #[allow(unused)]
     pub ipc_socket: bool,
+
+    /// Custom post-process shaders (chained in order).
+    #[config(alias = "custom-shader")]
+    pub custom_shader: CustomShaderPaths,
 }
 
 impl Default for General {
@@ -36,6 +42,7 @@ impl Default for General {
             ipc_socket: true,
             working_directory: Default::default(),
             import: Default::default(),
+            custom_shader: Default::default(),
         }
     }
 }

@@ -15,7 +15,7 @@ use glutin::error::ErrorKind;
 use glutin::prelude::*;
 use glutin::surface::{Surface, SwapInterval, WindowSurface};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use parking_lot::MutexGuard;
 use serde::{Deserialize, Serialize};
 use winit::dpi::PhysicalSize;
@@ -32,7 +32,8 @@ use alacritty_terminal::index::{Column, Direction, Line, Point};
 use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{
-    self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermDamage, TermMode,
+    self, LineDamageBounds, MAX_MULTI_CURSORS, MIN_COLUMNS, MIN_SCREEN_LINES, MultiCursorInfo,
+    Term, TermDamage, TermMode,
 };
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
 
@@ -52,6 +53,7 @@ use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
+use crate::renderer::custom_shader::{CustomShaderPipeline, ShaderUniforms};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -338,6 +340,135 @@ impl DisplayUpdate {
     }
 }
 
+/// Tracks cursor position/color for the custom shader pipeline.
+struct CursorState {
+    current: [f32; 4],
+    previous: [f32; 4],
+    color: [f32; 4],
+    start_instant: Instant,
+    time_cursor_change: f32,
+    visible: bool,
+    multi_cursors: [[f32; 4]; MAX_MULTI_CURSORS],
+    previous_multi_cursors: [[f32; 4]; MAX_MULTI_CURSORS],
+    multi_cursor_types: [i32; MAX_MULTI_CURSORS],
+    multi_cursor_count: i32,
+    previous_multi_cursor_count: i32,
+    /// App-level cursor visibility (DECTCEM), not affected by blink.
+    app_visible: bool,
+    /// Timestamp of the last app-level mode change (DECTCEM transition).
+    time_mode_change: f32,
+    /// Previous cursor color for transition detection.
+    previous_color: [f32; 4],
+    /// Current cursor style (ghostty-compatible int).
+    cursor_style: i32,
+    /// Previous cursor style for transition detection.
+    previous_cursor_style: i32,
+}
+
+impl Default for CursorState {
+    fn default() -> Self {
+        Self {
+            current: [-1.0, -1.0, 0.0, 0.0],
+            previous: [-1.0, -1.0, 0.0, 0.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+            start_instant: Instant::now(),
+            time_cursor_change: 0.0,
+            visible: true,
+            multi_cursors: [[0.0; 4]; MAX_MULTI_CURSORS],
+            previous_multi_cursors: [[0.0; 4]; MAX_MULTI_CURSORS],
+            multi_cursor_types: [0; MAX_MULTI_CURSORS],
+            multi_cursor_count: 0,
+            previous_multi_cursor_count: 0,
+            app_visible: true,
+            time_mode_change: 0.0,
+            previous_color: [1.0, 1.0, 1.0, 1.0],
+            cursor_style: 0,
+            previous_cursor_style: 0,
+        }
+    }
+}
+
+/// Accumulates per-second render timer statistics.
+struct RenderTimerStats {
+    start_instant: Instant,
+    last_frame_time: f32,
+    accum_time: f32,
+    samples: Vec<f32>,
+    display_avg: f32,
+    display_p1: f32,
+    display_p99: f32,
+    display_mem: f32,
+}
+
+impl Default for RenderTimerStats {
+    fn default() -> Self {
+        Self {
+            start_instant: Instant::now(),
+            last_frame_time: 0.0,
+            accum_time: 0.0,
+            samples: Vec::with_capacity(240),
+            display_avg: 0.0,
+            display_p1: 0.0,
+            display_p99: 0.0,
+            display_mem: 0.0,
+        }
+    }
+}
+
+/// Get process RSS in megabytes.
+fn process_memory_mb() -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        use libc::{RUSAGE_INFO_V0, c_int, rusage_info_v0};
+        unsafe {
+            let mut ri = std::mem::MaybeUninit::<rusage_info_v0>::zeroed();
+            let ret = libc::proc_pid_rusage(
+                libc::getpid(),
+                RUSAGE_INFO_V0 as c_int,
+                ri.as_mut_ptr() as *mut _,
+            );
+            if ret == 0 {
+                ri.assume_init().ri_resident_size as f32 / (1024.0 * 1024.0)
+            } else {
+                0.0
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs;
+        // Read /proc/self/statm: fields are in pages. Second field is RSS.
+        fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map(|pages| {
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as f32;
+                pages as f32 * page_size / (1024.0 * 1024.0)
+            })
+            .unwrap_or(0.0)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let mut pmc = std::mem::MaybeUninit::<PROCESS_MEMORY_COUNTERS>::zeroed();
+            let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if GetProcessMemoryInfo(GetCurrentProcess(), pmc.as_mut_ptr(), size) != 0 {
+                pmc.assume_init().WorkingSetSize as f32 / (1024.0 * 1024.0)
+            } else {
+                0.0
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        0.0
+    }
+}
+
 /// The display wraps a window, font rasterizer, and GPU renderer.
 pub struct Display {
     pub window: Window,
@@ -381,6 +512,12 @@ pub struct Display {
 
     /// Damage tracker for the given display.
     pub damage_tracker: DamageTracker,
+
+    /// Custom shader cursor tracking state.
+    cursor_state: CursorState,
+
+    /// Render timer statistics (debug only).
+    render_timer_stats: RenderTimerStats,
 
     /// Font size used by the window.
     pub font_size: FontSize,
@@ -509,9 +646,23 @@ impl Display {
         let mut damage_tracker = DamageTracker::new(size_info.screen_lines(), size_info.columns());
         damage_tracker.debug = config.debug.highlight_damage;
 
-        // Disable vsync.
-        if let Err(err) = surface.set_swap_interval(&context, SwapInterval::DontWait) {
-            info!("Failed to disable vsync: {err}");
+        // Load custom shader pipeline if configured.
+        if !config.general.custom_shader.is_empty() {
+            if let Some(pipeline) = CustomShaderPipeline::new(&config.general.custom_shader.0) {
+                renderer.set_custom_shader_pipeline(Some(pipeline));
+            }
+        }
+
+        // Enable vsync when custom shaders are active (continuous rendering),
+        // disable when not (on-demand rendering doesn't benefit from vsync).
+        let has_shaders = renderer.has_custom_shader_pipeline();
+        let interval = if has_shaders {
+            SwapInterval::Wait(NonZeroU32::new(1).unwrap())
+        } else {
+            SwapInterval::DontWait
+        };
+        if let Err(err) = surface.set_swap_interval(&context, interval) {
+            info!("Failed to set swap interval: {err}");
         }
 
         Ok(Self {
@@ -524,6 +675,8 @@ impl Display {
             frame_timer: FrameTimer::new(),
             raw_window_handle,
             damage_tracker,
+            cursor_state: CursorState::default(),
+            render_timer_stats: RenderTimerStats::default(),
             glyph_cache,
             hint_state,
             size_info,
@@ -619,6 +772,350 @@ impl Display {
         };
         if let Err(err) = res {
             debug!("error calling swap_buffers: {err}");
+        }
+    }
+
+    /// Whether custom shaders need a redraw this frame.
+    ///
+    /// Returns true only when a shader animation is likely still playing
+    /// (within MAX_ANIMATION_SECS of the last cursor or mode change).
+    /// Combined with vsync, this keeps GPU idle when nothing is animating.
+    ///
+    /// Note for shader authors: ambient effects that depend on `iTime` without
+    /// cursor/mode changes will freeze after this timeout. This is intentional
+    /// for battery life. Trigger redraws via cursor movement or mode switches.
+    pub fn needs_shader_redraw(&self) -> bool {
+        if !self.renderer.has_custom_shader_pipeline() {
+            return false;
+        }
+
+        const MAX_ANIMATION_SECS: f32 = 2.0;
+
+        let elapsed = self.cursor_state.start_instant.elapsed().as_secs_f32();
+        let since_cursor = elapsed - self.cursor_state.time_cursor_change;
+        let since_mode = elapsed - self.cursor_state.time_mode_change;
+
+        since_cursor < MAX_ANIMATION_SECS || since_mode < MAX_ANIMATION_SECS
+    }
+
+    /// Convert cursor shape to ghostty-compatible int for shader uniforms.
+    /// Hidden is not a style -- `iCursorVisible` signals that instead.
+    /// Returns `None` for Hidden so callers preserve the last-known style.
+    fn cursor_style_int(shape: CursorShape) -> Option<i32> {
+        match shape {
+            CursorShape::Block => Some(0),
+            CursorShape::HollowBlock => Some(1),
+            CursorShape::Beam => Some(2),
+            CursorShape::Underline => Some(3),
+            CursorShape::Hidden => None,
+        }
+    }
+
+    /// Compute cursor rect as (x_left, y_bottom, w, h) in top-left-origin
+    /// pixel space, matching the actual rendered cursor shape and size.
+    fn cursor_rect(cursor: &RenderableCursor, size_info: &SizeInfo, thickness: f32) -> [f32; 4] {
+        let point = cursor.point();
+        let x = point.column.0 as f32 * size_info.cell_width() + size_info.padding_x();
+        let y_top = point.line as f32 * size_info.cell_height() + size_info.padding_y();
+        let cell_w = size_info.cell_width() * cursor.width().get() as f32;
+        let cell_h = size_info.cell_height();
+        let thick = (thickness * size_info.cell_width()).round().max(1.);
+
+        let (w, h, y_off) = match cursor.shape() {
+            CursorShape::Beam => (thick, cell_h, 0.0),
+            CursorShape::Underline => (cell_w, thick, cell_h - thick),
+            _ => (cell_w, cell_h, 0.0), // Block, HollowBlock, Hidden.
+        };
+
+        [x, y_top + y_off + h, w, h]
+    }
+
+    /// Compute cursor color as [r, g, b, a] in 0.0-1.0 range.
+    fn cursor_color(cursor: &RenderableCursor) -> [f32; 4] {
+        let c = cursor.color();
+        [f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0, 1.0]
+    }
+
+    /// Update cursor tracking state for the custom shader pipeline.
+    ///
+    /// Returns `true` if the custom shader pipeline is active and should be used
+    /// for rendering this frame.
+    fn update_custom_shader_state(
+        &mut self,
+        cursor: &RenderableCursor,
+        size_info: &SizeInfo,
+        config: &UiConfig,
+        extra_cursors: &[MultiCursorInfo],
+        app_cursor_visible: bool,
+    ) -> bool {
+        if !self.renderer.has_custom_shader_pipeline() {
+            return false;
+        }
+
+        let new_rect = Self::cursor_rect(cursor, size_info, config.cursor.thickness());
+        let new_color = Self::cursor_color(cursor);
+        let cs = &mut self.cursor_state;
+        let now = cs.start_instant.elapsed().as_secs_f64() as f32;
+
+        // Always extract position, regardless of visibility.
+        let cursor_visible = !matches!(cursor.shape(), CursorShape::Hidden);
+
+        // Detect app-level mode change (DECTCEM), ignoring blink transitions.
+        let mode_changed = app_cursor_visible != cs.app_visible;
+
+        // When hidden (blink-off, DECTCEM off), cursor_rect returns a block-sized rect
+        // at the cursor position (falls through to the _ arm in cursor_rect match).
+        // Only update rect when visible OR when position has changed, to avoid
+        // overwriting a good rect with a potentially zero-size hidden rect.
+        let pos_changed = new_rect[0] != cs.current[0] || new_rect[1] != cs.current[1];
+        if cursor_visible || pos_changed || mode_changed {
+            let size_changed =
+                cursor_visible && (new_rect[2] != cs.current[2] || new_rect[3] != cs.current[3]);
+            if pos_changed || size_changed || mode_changed {
+                cs.previous = cs.current;
+                cs.previous_multi_cursor_count = cs.multi_cursor_count;
+                // When multi-cursors are active and incoming extra_cursors is
+                // non-empty, skip the timer reset for position-only moves.
+                // Through a multiplexer, content rendering moves the primary
+                // cursor before the multi-cursor sequence arrives in the same
+                // frame, causing a spurious timer reset that replays animations.
+                //
+                // But when extra_cursors is empty (e.g. switching from a
+                // multi-cursor app to a plain terminal tab), always reset so
+                // the shader pipeline picks up the new cursor position.
+                if mode_changed
+                    || extra_cursors.is_empty()
+                    || cs.multi_cursor_count == 0
+                {
+                    cs.time_cursor_change = now;
+                }
+            }
+            // On mode change, suppress trail by syncing previous to new position.
+            if mode_changed {
+                cs.previous[0] = new_rect[0];
+                cs.previous[1] = new_rect[1];
+            }
+            if cursor_visible {
+                // Full update: position, size, and color.
+                if new_color != cs.color {
+                    cs.previous_color = cs.color;
+                }
+                cs.current = new_rect;
+                cs.color = new_color;
+            } else {
+                // Hidden but moved: update position only, keep last-known size.
+                cs.current[0] = new_rect[0];
+                cs.current[1] = new_rect[1];
+            }
+        }
+        cs.visible = cursor_visible;
+
+        // Track cursor style and color changes.
+        // Hidden returns None -- preserve last-known style (iCursorVisible handles visibility).
+        if let Some(new_style) = Self::cursor_style_int(cursor.shape()) {
+            if new_style != cs.cursor_style {
+                cs.previous_cursor_style = cs.cursor_style;
+                cs.cursor_style = new_style;
+            }
+        }
+
+        if mode_changed && !pos_changed {
+            // Only timestamp mode changes at the same position (e.g. vim
+            // mode switch). Tab/pane switches change both DECTCEM and
+            // position; those should not trigger mode-change effects.
+            cs.time_mode_change = now;
+        }
+        cs.app_visible = app_cursor_visible;
+
+        // Process extra cursors from kitty multi-cursor protocol.
+        // All extra cursors are secondary; the main terminal cursor is primary.
+        if extra_cursors.is_empty() {
+            if cs.multi_cursor_count != 0 {
+                // Cursor count transition (multi -> single): treat as mode change.
+                cs.previous_multi_cursors = cs.multi_cursors;
+                cs.previous_multi_cursor_count = cs.multi_cursor_count;
+                cs.time_cursor_change = now;
+                cs.multi_cursor_count = 0;
+            }
+        } else {
+            let mut count = 0usize;
+            let mut new_cursors = [[0.0f32; 4]; MAX_MULTI_CURSORS];
+
+            for mc in extra_cursors.iter().take(MAX_MULTI_CURSORS) {
+                let x = mc.col as f32 * size_info.cell_width() + size_info.padding_x();
+                let y_top = mc.row as f32 * size_info.cell_height() + size_info.padding_y();
+                let cell_w = size_info.cell_width();
+                let cell_h = size_info.cell_height();
+
+                new_cursors[count] = [x, y_top + cell_h, cell_w, cell_h];
+                cs.multi_cursor_types[count] = 1; // All extra cursors are secondary.
+                count += 1;
+            }
+
+            // Only save previous positions and update timestamp when cursors actually moved.
+            let positions_changed = count as i32 != cs.multi_cursor_count
+                || new_cursors[..count] != cs.multi_cursors[..count];
+            if positions_changed {
+                cs.previous_multi_cursors = cs.multi_cursors;
+                cs.previous_multi_cursor_count = cs.multi_cursor_count;
+                cs.time_cursor_change = now;
+
+                // New cursors (indices beyond old count) have no previous position.
+                // Initialize their previous to current to avoid trails from (0,0).
+                let old_count = cs.multi_cursor_count.max(0) as usize;
+                if count > old_count {
+                    cs.previous_multi_cursors[old_count..count]
+                        .copy_from_slice(&new_cursors[old_count..count]);
+                }
+            }
+            cs.multi_cursors[..count].copy_from_slice(&new_cursors[..count]);
+
+            // On mode change, suppress trails by syncing all previous to current.
+            if mode_changed {
+                cs.previous_multi_cursors[..count].copy_from_slice(&new_cursors[..count]);
+            }
+
+            cs.multi_cursor_count = count as i32;
+        }
+
+        true
+    }
+
+    /// Bind the scene FBO for off-screen rendering, switching to standard alpha blending.
+    ///
+    /// Returns `true` if the FBO was successfully bound. Returns `false` if FBO
+    /// allocation failed (rendering falls back to direct-to-screen).
+    fn bind_shader_fbo(&mut self, size_info: &SizeInfo) -> bool {
+        if let Some(pipeline) = self.renderer.custom_shader_pipeline_mut() {
+            let w = size_info.width() as i32;
+            let h = size_info.height() as i32;
+            if pipeline.ensure_fbo(w, h) {
+                pipeline.bind_fbo();
+                self.renderer.set_fbo_mode(true);
+                self.damage_tracker.frame().mark_fully_damaged();
+                return true;
+            }
+            warn!("Custom shader FBO allocation failed, rendering direct to screen");
+        }
+        false
+    }
+
+    /// Run the custom shader post-process chain, or clean up stale FBOs.
+    fn run_custom_shader_pass(&mut self, effect_active: bool, size_info: &SizeInfo) {
+        if effect_active {
+            // Unbind FBO and restore dual-source blending.
+            if let Some(pipeline) = self.renderer.custom_shader_pipeline_mut() {
+                pipeline.unbind_fbo();
+            }
+            self.renderer.set_fbo_mode(false);
+
+            let cs = &self.cursor_state;
+            let time = cs.start_instant.elapsed().as_secs_f64() as f32;
+
+            // Build consolidated cursor arrays: primary at index 0, secondaries at 1+.
+            let mut current_cursors = [[0.0f32; 4]; MAX_MULTI_CURSORS];
+            let mut previous_cursors = [[0.0f32; 4]; MAX_MULTI_CURSORS];
+            let mut current_cursor_colors = [[0.0f32; 4]; MAX_MULTI_CURSORS];
+            let mut current_cursor_styles = [0i32; MAX_MULTI_CURSORS];
+            let mut previous_cursor_styles = [0i32; MAX_MULTI_CURSORS];
+            let mut current_cursor_types = [0i32; MAX_MULTI_CURSORS];
+
+            // When cursor is hidden (DECTCEM off) and multi-cursors exist, the
+            // native cursor position is unreliable: multiplexers move it during
+            // content rendering without sending CUP when DECTCEM is off. Use
+            // the first multi-cursor position for index 0 instead.
+            let use_multi_as_primary = !cs.app_visible && cs.multi_cursor_count > 0;
+
+            // Index 0: primary cursor (always populated for previous-position data).
+            if use_multi_as_primary {
+                current_cursors[0] = cs.multi_cursors[0];
+                previous_cursors[0] = cs.previous_multi_cursors[0];
+            } else {
+                current_cursors[0] = cs.current;
+                previous_cursors[0] = cs.previous;
+            }
+            current_cursor_colors[0] = cs.color;
+            current_cursor_styles[0] = cs.cursor_style;
+            previous_cursor_styles[0] = cs.previous_cursor_style;
+            // current_cursor_types[0] = 0 (primary) -- already zero-initialized.
+
+            // Indices 1+: secondary cursors from kitty multi-cursor protocol.
+            // Secondary cursors share the primary cursor's color and style.
+            // When using multi-cursor as primary, skip the first one (already at index 0).
+            let sec = cs.multi_cursor_count.max(0) as usize;
+            let previous_sec = cs.previous_multi_cursor_count.max(0) as usize;
+            let start = if use_multi_as_primary { 1 } else { 0 };
+            let max_sec = sec.max(previous_sec).min(MAX_MULTI_CURSORS - 1);
+            for i in start..max_sec {
+                if i < sec {
+                    current_cursors[1 + i - start] = cs.multi_cursors[i];
+                    current_cursor_colors[1 + i - start] = cs.color;
+                    current_cursor_styles[1 + i - start] = cs.cursor_style;
+                    current_cursor_types[1 + i - start] = cs.multi_cursor_types[i];
+                }
+                // Always populate previous from the array -- new entries are
+                // initialized to their current position in update_custom_shader_state
+                // (lines 1020-1026), so this is safe for all indices in range.
+                previous_cursors[1 + i - start] = cs.previous_multi_cursors[i];
+                previous_cursor_styles[1 + i - start] = cs.previous_cursor_style;
+            }
+
+            // Per spec: extra cursors share main cursor's blink state, but
+            // main cursor visibility (DECTCEM) does not affect extra cursors.
+            // Blink-off = !visible && app_visible. DECTCEM-off = !app_visible.
+            //
+            // When using multi-cursor as primary (start=1), one multi-cursor
+            // was consumed into index 0, so subtract it from the count.
+            let start_i32 = start as i32;
+            let (current_cursor_count, previous_cursor_count) =
+                if cs.visible || (!cs.app_visible && cs.multi_cursor_count > 0) {
+                    // Cursor visible, or DECTCEM off with multi-cursor data.
+                    (
+                        1 + cs.multi_cursor_count - start_i32,
+                        1 + cs.previous_multi_cursor_count - start_i32,
+                    )
+                } else if !cs.app_visible {
+                    // DECTCEM off, no multi-cursors: native cursor position is
+                    // unreliable (multiplexer content rendering moves it).
+                    (0, 0)
+                } else {
+                    // Blink-off: suppress current cursors but keep previous_cursor_count
+                    // so shaders can animate cursor disappearance via iPreviousCursors.
+                    (0, 1 + cs.previous_multi_cursor_count - start_i32)
+                };
+
+            let uniforms = ShaderUniforms {
+                resolution: [size_info.width(), size_info.height()],
+                time,
+                time_cursor_change: cs.time_cursor_change,
+                time_mode_change: cs.time_mode_change,
+                current_cursor: current_cursors[0],
+                previous_cursor: previous_cursors[0],
+                current_cursor_color: cs.color,
+                previous_cursor_color: cs.previous_color,
+                cursor_visible: if cs.visible { 1.0 } else { 0.0 },
+                current_cursor_style: cs.cursor_style,
+                previous_cursor_style: cs.previous_cursor_style,
+                current_cursors,
+                previous_cursors,
+                current_cursor_colors,
+                current_cursor_styles,
+                previous_cursor_styles,
+                current_cursor_types,
+                current_cursor_count,
+                previous_cursor_count,
+            };
+
+            if let Some(pipeline) = self.renderer.custom_shader_pipeline_mut() {
+                pipeline.draw(size_info, &uniforms);
+            }
+        } else {
+            // Free FBO when no shader is active (e.g., removed via config reload).
+            if let Some(pipeline) = self.renderer.custom_shader_pipeline_mut() {
+                if pipeline.has_fbo() {
+                    pipeline.delete_fbo();
+                }
+            }
         }
     }
 
@@ -797,6 +1294,18 @@ impl Display {
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
 
+        // Update custom shader state and check if post-process shaders are active.
+        let extra_cursors = terminal.multi_cursors();
+        let has_extra_cursors = !extra_cursors.is_empty();
+        let app_cursor_visible = terminal.mode().contains(TermMode::SHOW_CURSOR);
+        let effect_active = self.update_custom_shader_state(
+            &cursor,
+            &size_info,
+            config,
+            extra_cursors,
+            app_cursor_visible,
+        );
+
         let vi_mode = terminal.mode().contains(TermMode::VI);
         let vi_cursor_point = if vi_mode { Some(terminal.vi_mode_cursor.point) } else { None };
 
@@ -834,6 +1343,9 @@ impl Display {
 
         // Make sure this window's OpenGL context is active.
         self.make_current();
+
+        // Bind FBO and switch to standard alpha blending for custom shaders.
+        let effect_active = if effect_active { self.bind_shader_fbo(&size_info) } else { false };
 
         self.renderer.clear(background_color, config.window_opacity());
         let mut lines = RenderLines::new();
@@ -892,8 +1404,12 @@ impl Display {
             self.draw_line_indicator(config, total_lines, None, display_offset);
         };
 
-        // Draw cursor.
-        rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+        // Draw cursor. When multi-cursor protocol is active, the shader handles
+        // all cursor rendering via iCurrentCursors[] -- suppress the native cursor rect
+        // to avoid visual overlap.
+        if !has_extra_cursors {
+            rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+        }
 
         // Push visual bell after url/underline/strikeout rects.
         let visual_bell_intensity = self.visual_bell.intensity();
@@ -1008,6 +1524,17 @@ impl Display {
             self.renderer.draw_rects(&size_info, &metrics, rects);
         }
 
+        // Run custom shader post-process chain (or clean up stale FBOs).
+        self.run_custom_shader_pass(effect_active, &size_info);
+
+        // Restore padded viewport after shader pass (which uses full-window viewport).
+        // Required for render timer, hyperlink preview, and damage highlight positioning.
+        if effect_active {
+            self.renderer.set_viewport(&size_info);
+        }
+
+        // Render timer draws after the shader pass, so it appears on top of
+        // post-processed output and is not affected by custom shader effects.
         self.draw_render_timer(config);
 
         // Draw hyperlink uri preview.
@@ -1039,7 +1566,9 @@ impl Display {
 
         // XXX: Request the new frame after swapping buffers, so the
         // time to finish OpenGL operations is accounted for in the timeout.
-        if !matches!(self.raw_window_handle, RawWindowHandle::Wayland(_)) {
+        // On Wayland, only request frames when shaders are active (compositor controls
+        // frame pacing otherwise). On X11/macOS, frames are always requested.
+        if effect_active || !matches!(self.raw_window_handle, RawWindowHandle::Wayland(_)) {
             self.request_frame(scheduler);
         }
 
@@ -1051,6 +1580,38 @@ impl Display {
         self.damage_tracker.debug = config.debug.highlight_damage;
         self.visual_bell.update_config(&config.bell);
         self.colors = List::from(&config.colors);
+
+        // Reload custom shader pipeline if config changed.
+        let has_new_shaders = !config.general.custom_shader.is_empty();
+        let has_current_pipeline = self.renderer.has_custom_shader_pipeline();
+
+        match (has_new_shaders, has_current_pipeline) {
+            (true, _) => {
+                // Shaders configured -- reload entire pipeline.
+                let pipeline = CustomShaderPipeline::new(&config.general.custom_shader.0);
+                self.renderer.set_custom_shader_pipeline(pipeline);
+                if self.renderer.custom_shader_pipeline_mut().is_none() {
+                    warn!("Custom shader pipeline reload failed, effects disabled");
+                }
+            },
+            (false, true) => {
+                // Shaders removed from config -- clean up.
+                self.renderer.set_custom_shader_pipeline(None);
+                self.cursor_state = CursorState::default();
+                info!("Custom shader pipeline disabled");
+            },
+            (false, false) => {},
+        }
+
+        // Toggle vsync based on shader state.
+        let interval = if self.renderer.has_custom_shader_pipeline() {
+            SwapInterval::Wait(NonZeroU32::new(1).unwrap())
+        } else {
+            SwapInterval::DontWait
+        };
+        if let Err(err) = self.surface.set_swap_interval(&self.context, interval) {
+            info!("Failed to set swap interval: {err}");
+        }
     }
 
     /// Update the mouse/vi mode cursor hint highlighting.
@@ -1332,7 +1893,45 @@ impl Display {
             return;
         }
 
-        let timing = format!("{:.3} usec", self.meter.average());
+        // Accumulate samples, publish stats every 1 second.
+        let elapsed = self.render_timer_stats.start_instant.elapsed().as_secs_f64() as f32;
+        let stats = &mut self.render_timer_stats;
+
+        // Skip first frame to avoid a huge initial delta.
+        if stats.last_frame_time == 0.0 {
+            stats.last_frame_time = elapsed;
+            return;
+        }
+
+        let dt = (elapsed - stats.last_frame_time).max(0.0001);
+        stats.last_frame_time = elapsed;
+        let render_usec = self.meter.average() as f32;
+        stats.accum_time += dt;
+        stats.samples.push(render_usec);
+
+        if stats.accum_time >= 1.0 {
+            let n = stats.samples.len();
+            if n > 0 {
+                stats.samples.sort_unstable_by(|a, b| a.total_cmp(b));
+                let sum: f32 = stats.samples.iter().sum();
+                stats.display_avg = sum / n as f32;
+                // 1% percentiles.
+                let p1 = (n / 100).max(1) - 1;
+                let p99 = n.saturating_sub((n / 100).max(1));
+                stats.display_p1 = stats.samples[p1];
+                stats.display_p99 = stats.samples[p99];
+            }
+            // Sample memory only once per second.
+            stats.display_mem = process_memory_mb();
+            stats.accum_time = 0.0;
+            stats.samples.clear();
+            stats.samples.shrink_to(256);
+        }
+
+        let timing = format!(
+            "{:.0} usec (p1: {:.0} / p99: {:.0}) | {:.0} MB",
+            stats.display_avg, stats.display_p1, stats.display_p99, stats.display_mem,
+        );
         let point = Point::new(self.size_info.screen_lines().saturating_sub(2), Column(0));
         let fg = config.colors.primary.background;
         let bg = config.colors.normal.red;

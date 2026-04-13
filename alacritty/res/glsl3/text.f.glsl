@@ -36,6 +36,10 @@ layout(location = 0, index = 1) out vec4 alphaMask;
 uniform int_t renderingPass;
 uniform sampler2D mask;
 
+// When rendering to FBO for custom shaders, use standard alpha blending
+// instead of dual-source (which breaks on macOS Metal with FBOs).
+uniform int_t fboMode;
+
 void main() {
     if (renderingPass == 0) {
         if (bg.a == 0.0) {
@@ -56,18 +60,33 @@ void main() {
     if (int(colored) == COLORED) {
         // Color glyphs, like emojis.
         FRAG_COLOR = texture(mask, TexCoords);
-        ALPHA_MASK = vec4(FRAG_COLOR.a);
+        float_t a = FRAG_COLOR.a;
 
         // Revert alpha premultiplication.
-        if (FRAG_COLOR.a != 0.0) {
-            FRAG_COLOR.rgb = vec3(FRAG_COLOR.rgb / FRAG_COLOR.a);
+        if (a != 0.0) {
+            FRAG_COLOR.rgb = vec3(FRAG_COLOR.rgb / a);
         }
 
-        FRAG_COLOR = vec4(FRAG_COLOR.rgb, 1.0);
+        if (fboMode != 0) {
+            // FBO mode: premultiplied alpha for ONE, ONE_MINUS_SRC_ALPHA blend.
+            FRAG_COLOR = vec4(FRAG_COLOR.rgb * a, a);
+            ALPHA_MASK = vec4(1.0);
+        } else {
+            FRAG_COLOR = vec4(FRAG_COLOR.rgb, 1.0);
+            ALPHA_MASK = vec4(a);
+        }
     } else {
         // Regular text glyphs.
         vec3_t textColor = texture(mask, TexCoords).rgb;
-        ALPHA_MASK = vec4(textColor, textColor.r);
-        FRAG_COLOR = vec4(fg.rgb, 1.0);
+
+        if (fboMode != 0) {
+            // FBO mode: premultiplied alpha for ONE, ONE_MINUS_SRC_ALPHA blend.
+            FRAG_COLOR = vec4(fg.rgb * textColor.r, textColor.r);
+            ALPHA_MASK = vec4(1.0);
+        } else {
+            // Normal: dual-source subpixel blending.
+            ALPHA_MASK = vec4(textColor, textColor.r);
+            FRAG_COLOR = vec4(fg.rgb, 1.0);
+        }
     }
 }

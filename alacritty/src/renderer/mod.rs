@@ -20,9 +20,11 @@ use crate::display::SizeInfo;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
 use crate::gl;
+use crate::renderer::custom_shader::CustomShaderPipeline;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
+pub mod custom_shader;
 pub mod platform;
 pub mod rects;
 mod shader;
@@ -31,7 +33,7 @@ mod text;
 pub use text::{GlyphCache, LoaderApi};
 
 use shader::ShaderVersion;
-use text::{Gles2Renderer, Glsl3Renderer, TextRenderer};
+use text::{Gles2Renderer, Glsl3Renderer, TextRenderer, TextShader};
 
 /// Whether the OpenGL functions have been loaded.
 pub static GL_FUNS_LOADED: AtomicBool = AtomicBool::new(false);
@@ -89,7 +91,9 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    custom_shader_pipeline: Option<CustomShaderPipeline>,
     robustness: bool,
+    fbo_mode: bool,
 }
 
 /// Wrapper around gl::GetString with error checking and reporting.
@@ -171,7 +175,13 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, robustness })
+        Ok(Self {
+            text_renderer,
+            rect_renderer,
+            custom_shader_pipeline: None,
+            robustness,
+            fbo_mode: false,
+        })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -256,8 +266,12 @@ impl Renderer {
 
         // Activate regular state again.
         unsafe {
-            // Reset blending strategy.
-            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+            // Restore blending strategy based on current mode.
+            if self.fbo_mode {
+                gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
+            } else {
+                gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+            }
 
             // Restore viewport with padding.
             self.set_viewport(size_info);
@@ -346,6 +360,48 @@ impl Renderer {
             TextRendererProvider::Gles2(renderer) => renderer.resize(size_info),
             TextRendererProvider::Glsl3(renderer) => renderer.resize(size_info),
         }
+    }
+
+    /// Set the custom shader pipeline.
+    pub fn set_custom_shader_pipeline(&mut self, pipeline: Option<CustomShaderPipeline>) {
+        self.custom_shader_pipeline = pipeline;
+    }
+
+    /// Get a mutable reference to the custom shader pipeline, if configured.
+    pub fn custom_shader_pipeline_mut(&mut self) -> Option<&mut CustomShaderPipeline> {
+        self.custom_shader_pipeline.as_mut()
+    }
+
+    /// Whether a custom shader pipeline is configured.
+    pub fn has_custom_shader_pipeline(&self) -> bool {
+        self.custom_shader_pipeline.is_some()
+    }
+
+    /// Toggle FBO rendering mode.
+    ///
+    /// Changes GL state: binds the text shader program to set the fboMode uniform,
+    /// then unbinds. Also switches blend function between dual-source (normal) and
+    /// standard alpha (FBO). Only affects GLSL3 renderer; GLES2 is a no-op for the
+    /// uniform but still gets the blend function change via the fbo_mode flag.
+    pub fn set_fbo_mode(&mut self, enabled: bool) {
+        self.fbo_mode = enabled;
+        if let TextRendererProvider::Glsl3(renderer) = &self.text_renderer {
+            let program = TextRenderer::program(renderer);
+            unsafe {
+                gl::UseProgram(program.id());
+            }
+            program.set_fbo_mode(enabled);
+            unsafe {
+                if enabled {
+                    gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
+                } else {
+                    gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+                }
+                gl::UseProgram(0);
+            }
+        }
+        // GLES2 renderer does not support the fboMode uniform or custom shaders.
+        // The fbo_mode flag still affects blend function selection in draw_rects.
     }
 }
 
